@@ -407,15 +407,11 @@ class TestEnv5Continuous(Environment):
     def step_env(self, key, state, action, params):
         obs = self.get_obs(state)
         reward = -jnp.abs(action - obs).squeeze()
-        state = state.replace(
-            obs=jax.random.uniform(key, minval=-1, maxval=1, shape=(1,))
-        )
+        state = state.replace(obs=jax.random.uniform(key, minval=-1, maxval=1, shape=(1,)))
         return obs, state, reward, self.is_terminal(state, params), {}
 
     def reset_env(self, key, params):
-        state = TestEnvState5(
-            obs=jax.random.uniform(key, minval=-1, maxval=1, shape=(1,))
-        )
+        state = TestEnvState5(obs=jax.random.uniform(key, minval=-1, maxval=1, shape=(1,)))
         return self.get_obs(state), state
 
     def get_obs(self, state):

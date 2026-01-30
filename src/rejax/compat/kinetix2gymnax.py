@@ -25,9 +25,7 @@ def create_kinetix(env_name, **kwargs):
     # Very hacky! But rejax generally assumes that max_steps_in_episode exists. Once we
     # try to replace this it will get dicey. This is on the Mikeys for not adhering to
     # the gymnax API!
-    env_params = EnvParams(
-        _base=env_params, max_steps_in_episode=env_params.max_timesteps
-    )
+    env_params = EnvParams(_base=env_params, max_steps_in_episode=env_params.max_timesteps)
     return env, env_params
 
 
@@ -41,16 +39,11 @@ class EnvParams:
         try:
             return getattr(self._base, name)
         except AttributeError as err:
-            raise AttributeError(
-                f"{type(self).__name__} has no attribute {name!r}"
-            ) from err
+            raise AttributeError(f"{type(self).__name__} has no attribute {name!r}") from err
 
     def __repr__(self):
         base_repr = ", ".join(f"{k}={v!r}" for k, v in vars(self._base).items())
-        return (
-            f"{type(self).__name__}({base_repr}, "
-            f"max_steps_in_episode={self.max_steps_in_episode!r})"
-        )
+        return f"{type(self).__name__}({base_repr}, max_steps_in_episode={self.max_steps_in_episode!r})"
 
 
 # Override the replace method after the dataclass decorator runs

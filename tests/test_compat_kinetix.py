@@ -43,10 +43,7 @@ class TestKinetixCompat(unittest.TestCase):
                     self.assertEqual(obs.dtype, obs_space.dtype)
                     self.assertEqual(obs.shape, obs_space.shape)
                 except Exception as e:
-                    self.fail(
-                        f"Failed to get obs space for {level_name}: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                    self.fail(f"Failed to get obs space for {level_name}: {type(e).__name__}: {e}")
 
                 # Test action space and sampling
                 try:
@@ -55,17 +52,12 @@ class TestKinetixCompat(unittest.TestCase):
                     self.assertEqual(action.dtype, action_space.dtype)
                     self.assertEqual(action.shape, action_space.shape)
                 except Exception as e:
-                    self.fail(
-                        f"Failed to sample action for {level_name}: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                    self.fail(f"Failed to sample action for {level_name}: {type(e).__name__}: {e}")
 
                 # Test stepping
                 for step in range(5):
                     try:
-                        obs, state, reward, done, _info = jitted_step(
-                            rng, state, action, params
-                        )
+                        obs, state, reward, done, _info = jitted_step(rng, state, action, params)
 
                         # Check types and shapes
                         self.assertEqual(obs.dtype, obs_space.dtype)
@@ -78,10 +70,7 @@ class TestKinetixCompat(unittest.TestCase):
                             break
 
                     except Exception as e:
-                        self.fail(
-                            f"Failed to step {level_name} at step {step}: "
-                            f"{type(e).__name__}: {e}"
-                        )
+                        self.fail(f"Failed to step {level_name} at step {step}: {type(e).__name__}: {e}")
 
                     # Sample new action for next step
                     action = action_space.sample(rng)
@@ -141,9 +130,7 @@ class TestKinetixCompat(unittest.TestCase):
                 observation_type=ObservationType.SYMBOLIC_FLAT,
             )
         except Exception:
-            self.skipTest(
-                "No test level available for Kinetix or ActionType not available"
-            )
+            self.skipTest("No test level available for Kinetix or ActionType not available")
 
         # If we get here, the environment was created successfully
         self.assertIsNotNone(env)

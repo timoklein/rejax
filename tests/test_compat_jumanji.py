@@ -44,9 +44,7 @@ class TestJumanjiCompat(unittest.TestCase):
 
                 for _ in range(3):
                     try:
-                        obs, state, _reward, _done, _info = jitted_step(
-                            rng, state, a, params
-                        )
+                        obs, state, _reward, _done, _info = jitted_step(rng, state, a, params)
                     except Exception as e:
                         self.fail(f"Failed to step: {type(e).__name__}: {e}")
 

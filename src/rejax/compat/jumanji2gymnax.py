@@ -32,13 +32,9 @@ def convert_spec(spec: Spec) -> spaces.Space:
     elif isinstance(spec, DiscreteArray):
         return spaces.Discrete(num_categories=int(spec.num_values))
     elif isinstance(spec, BoundedArray):
-        return spaces.Box(
-            low=spec.minimum, high=spec.maximum, shape=spec.shape, dtype=spec.dtype
-        )
+        return spaces.Box(low=spec.minimum, high=spec.maximum, shape=spec.shape, dtype=spec.dtype)
     elif isinstance(spec, Array):
-        return spaces.Box(
-            low=-jnp.inf, high=jnp.inf, shape=spec.shape, dtype=spec.dtype
-        )
+        return spaces.Box(low=-jnp.inf, high=jnp.inf, shape=spec.shape, dtype=spec.dtype)
     return spaces.Dict({k: convert_spec(v) for k, v in spec._specs.items()})
 
 

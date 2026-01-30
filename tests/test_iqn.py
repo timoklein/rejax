@@ -31,9 +31,7 @@ class TestEnvironmentsIQN(unittest.TestCase):
         env = TestEnv1Discrete()
         iqn = IQN.create(env=env, **self.args)
         ts, _ = self.train_fn(iqn)
-        value = iqn.agent.apply(
-            ts.q_ts.params, jax.numpy.array([0]), self.rng, method="q"
-        )
+        value = iqn.agent.apply(ts.q_ts.params, jax.numpy.array([0]), self.rng, method="q")
         self.assertAlmostEqual(value, 1.0, delta=0.1)
 
     def test_env2(self):
@@ -66,9 +64,7 @@ class TestEnvironmentsIQN(unittest.TestCase):
         ts, _ = self.train_fn(iqn)
 
         best_action = 1
-        value = iqn.agent.apply(
-            ts.q_ts.params, jax.numpy.array([0]), self.rng, method="q"
-        )
+        value = iqn.agent.apply(ts.q_ts.params, jax.numpy.array([0]), self.rng, method="q")
         self.assertEqual(value.argmax(), best_action)
 
         act = iqn.make_act(ts)

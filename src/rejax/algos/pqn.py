@@ -52,9 +52,7 @@ class PQN(
                 obs = self.normalize_obs(ts.obs_rms_state, obs)
 
             obs = jnp.expand_dims(obs, 0)
-            action = self.agent.apply(
-                ts.q_ts.params, obs, rng, epsilon=0.005, method="act"
-            )
+            action = self.agent.apply(ts.q_ts.params, obs, rng, epsilon=0.005, method="act")
             return jnp.squeeze(action)
 
         return act
@@ -65,9 +63,7 @@ class PQN(
         agent_kwargs["activation"] = lambda x: nn.relu(nn.LayerNorm()(x))
 
         action_dim = env.action_space(env_params).n
-        agent = EpsilonGreedyPolicy(DiscreteQNetwork)(
-            hidden_layer_sizes=(64, 64), action_dim=action_dim, **agent_kwargs
-        )
+        agent = EpsilonGreedyPolicy(DiscreteQNetwork)(hidden_layer_sizes=(64, 64), action_dim=action_dim, **agent_kwargs)
         return {"agent": agent}
 
     @register_init
@@ -110,9 +106,7 @@ class PQN(
             rng, new_rng = jax.random.split(ts.rng)
             ts = ts.replace(rng=rng)
             rng_action, rng_step = jax.random.split(new_rng)
-            action = self.agent.apply(
-                ts.q_ts.params, ts.last_obs, rng_action, epsilon=epsilon, method="act"
-            )
+            action = self.agent.apply(ts.q_ts.params, ts.last_obs, rng_action, epsilon=epsilon, method="act")
 
             rng_step = jax.random.split(rng_step, self.num_envs)
             transition = self.vmap_step(rng_step, ts.env_state, action, self.env_params)
@@ -120,14 +114,10 @@ class PQN(
             next_q = self.agent.apply(ts.q_ts.params, next_obs)
 
             if self.normalize_observations:
-                obs_rms_state, next_obs = self.update_and_normalize_obs(
-                    ts.obs_rms_state, next_obs
-                )
+                obs_rms_state, next_obs = self.update_and_normalize_obs(ts.obs_rms_state, next_obs)
                 ts = ts.replace(obs_rms_state=obs_rms_state)
             if self.normalize_rewards:
-                rew_rms_state, reward = self.update_and_normalize_rew(
-                    ts.rew_rms_state, reward, done
-                )
+                rew_rms_state, reward = self.update_and_normalize_rew(ts.rew_rms_state, reward, done)
                 ts = ts.replace(rew_rms_state=rew_rms_state)
 
             # Return updated state and transition

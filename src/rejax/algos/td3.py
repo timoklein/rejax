@@ -67,9 +67,7 @@ class TD3(
             env.action_space(env_params).high,
         )
         action_dim = np.prod(env.action_space(env_params).shape)
-        actor = DeterministicPolicy(
-            action_dim, action_range, hidden_layer_sizes=(64, 64), **actor_kwargs
-        )
+        actor = DeterministicPolicy(action_dim, action_range, hidden_layer_sizes=(64, 64), **actor_kwargs)
 
         critic_kwargs = config.pop("critic_kwargs", {})
         activation = critic_kwargs.pop("activation", "swish")
@@ -180,9 +178,7 @@ class TD3(
                     next_obs=self.normalize_obs(ts.obs_rms_state, minibatch.next_obs),
                 )
             if self.normalize_rewards:
-                minibatch = minibatch._replace(
-                    reward=self.normalize_rew(ts.rew_rms_state, minibatch.reward)
-                )
+                minibatch = minibatch._replace(reward=self.normalize_rew(ts.rew_rms_state, minibatch.reward))
 
             # Update network
             ts = self.update_critic(ts, minibatch)
@@ -220,10 +216,7 @@ class TD3(
             critic_tp = self.polyak_update(ts.critic_ts.params, ts.critic_target_params)
             actor_tp = self.polyak_update(ts.actor_ts.params, ts.actor_target_params)
         else:
-            update_target_params = (
-                ts.global_step % self.target_update_freq
-                <= old_global_step % self.target_update_freq
-            )
+            update_target_params = ts.global_step % self.target_update_freq <= old_global_step % self.target_update_freq
             critic_tp = jax.tree.map(
                 lambda q, qt: jax.lax.select(update_target_params, q, qt),
                 self.polyak_update(ts.critic_ts.params, ts.critic_target_params),
@@ -264,18 +257,12 @@ class TD3(
         rng, rng_steps = jax.random.split(ts.rng)
         ts = ts.replace(rng=rng)
         rng_steps = jax.random.split(rng_steps, self.num_envs)
-        next_obs, env_state, rewards, dones, _ = self.vmap_step(
-            rng_steps, ts.env_state, actions, self.env_params
-        )
+        next_obs, env_state, rewards, dones, _ = self.vmap_step(rng_steps, ts.env_state, actions, self.env_params)
 
         if self.normalize_observations:
-            ts = ts.replace(
-                obs_rms_state=self.update_obs_rms(ts.obs_rms_state, next_obs)
-            )
+            ts = ts.replace(obs_rms_state=self.update_obs_rms(ts.obs_rms_state, next_obs))
         if self.normalize_rewards:
-            ts = ts.replace(
-                rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones)
-            )
+            ts = ts.replace(rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones))
 
         # Return minibatch and updated train state
         minibatch = Minibatch(
@@ -303,9 +290,7 @@ class TD3(
             action_low, action_high = self.action_space.low, self.action_space.high
             action = jnp.clip(action + noise, action_low, action_high)
 
-            qs_target = self.vmap_critic(
-                ts.critic_target_params, minibatch.next_obs, action
-            )
+            qs_target = self.vmap_critic(ts.critic_target_params, minibatch.next_obs, action)
             q_target = jnp.min(qs_target, axis=0)
             target = minibatch.reward + (1 - minibatch.done) * self.gamma * q_target
             q1, q2 = self.vmap_critic(params, minibatch.obs, minibatch.action)

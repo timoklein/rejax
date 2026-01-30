@@ -35,9 +35,7 @@ class DQN(
                 obs = self.normalize_obs(ts.obs_rms_state, obs)
 
             obs = jnp.expand_dims(obs, 0)
-            action = self.agent.apply(
-                ts.q_ts.params, obs, rng, epsilon=0.005, method="act"
-            )
+            action = self.agent.apply(ts.q_ts.params, obs, rng, epsilon=0.005, method="act")
             return jnp.squeeze(action)
 
         return act
@@ -54,9 +52,7 @@ class DQN(
         agent_kwargs["activation"] = getattr(nn, activation)
 
         action_dim = env.action_space(env_params).n
-        agent = EpsilonGreedyPolicy(agent_cls)(
-            hidden_layer_sizes=(64, 64), action_dim=action_dim, **agent_kwargs
-        )
+        agent = EpsilonGreedyPolicy(agent_cls)(hidden_layer_sizes=(64, 64), action_dim=action_dim, **agent_kwargs)
 
         return {"agent": agent}
 
@@ -100,9 +96,7 @@ class DQN(
             return ts
 
         def do_updates(ts):
-            return jax.lax.fori_loop(
-                0, self.num_epochs, lambda _, ts: update_iteration(ts), ts
-            )
+            return jax.lax.fori_loop(0, self.num_epochs, lambda _, ts: update_iteration(ts), ts)
 
         ts = jax.lax.cond(start_training, lambda: do_updates(ts), lambda: ts)
 
@@ -110,10 +104,7 @@ class DQN(
         if self.target_update_freq == 1:
             target_params = self.polyak_update(ts.q_ts.params, ts.q_target_params)
         else:
-            update_target_params = (
-                ts.global_step % self.target_update_freq
-                <= old_global_step % self.target_update_freq
-            )
+            update_target_params = ts.global_step % self.target_update_freq <= old_global_step % self.target_update_freq
             target_params = jax.tree.map(
                 lambda q, qt: jax.lax.select(update_target_params, q, qt),
                 self.polyak_update(ts.q_ts.params, ts.q_target_params),
@@ -138,26 +129,18 @@ class DQN(
             else:
                 last_obs = ts.last_obs
 
-            return self.agent.apply(
-                ts.q_ts.params, last_obs, rng, epsilon=epsilon, method="act"
-            )
+            return self.agent.apply(ts.q_ts.params, last_obs, rng, epsilon=epsilon, method="act")
 
         actions = jax.lax.cond(uniform, sample_uniform, sample_policy, rng_action)
 
         rng, rng_steps = jax.random.split(ts.rng)
         ts = ts.replace(rng=rng)
         rng_steps = jax.random.split(rng_steps, self.num_envs)
-        next_obs, env_state, rewards, dones, _ = self.vmap_step(
-            rng_steps, ts.env_state, actions, self.env_params
-        )
+        next_obs, env_state, rewards, dones, _ = self.vmap_step(rng_steps, ts.env_state, actions, self.env_params)
         if self.normalize_observations:
-            ts = ts.replace(
-                obs_rms_state=self.update_obs_rms(ts.obs_rms_state, next_obs)
-            )
+            ts = ts.replace(obs_rms_state=self.update_obs_rms(ts.obs_rms_state, next_obs))
         if self.normalize_rewards:
-            ts = ts.replace(
-                rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones)
-            )
+            ts = ts.replace(rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones))
 
         minibatch = Minibatch(
             obs=ts.last_obs,
@@ -186,16 +169,12 @@ class DQN(
         def ddqn_targets(q_params):
             next_q_values = self.agent.apply(q_params, mb.next_obs)
             next_action = jnp.argmax(next_q_values, axis=1, keepdims=True)
-            next_q_values_target = jnp.take_along_axis(
-                next_q_target_values, next_action, axis=1
-            ).squeeze(axis=1)
+            next_q_values_target = jnp.take_along_axis(next_q_target_values, next_action, axis=1).squeeze(axis=1)
             return next_q_values_target
 
         def loss_fn(q_params):
             q_values = self.agent.apply(q_params, mb.obs, mb.action, method="take")
-            next_q_values_target = jax.lax.cond(
-                self.ddqn, ddqn_targets, vanilla_targets, q_params
-            )
+            next_q_values_target = jax.lax.cond(self.ddqn, ddqn_targets, vanilla_targets, q_params)
             mask_done = jnp.logical_not(mb.done)
             targets = rewards + mask_done * self.gamma * next_q_values_target
             loss = optax.l2_loss(q_values, targets).mean()

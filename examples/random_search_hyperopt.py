@@ -40,9 +40,7 @@ def log_uniform(rng, minval, maxval):
     Samples from a uniform distribution in log space, meaning values close to minval
     are sampled more densely.
     """
-    return jnp.exp(
-        jax.random.uniform(rng, minval=jnp.log(minval), maxval=jnp.log(maxval))
-    )
+    return jnp.exp(jax.random.uniform(rng, minval=jnp.log(minval), maxval=jnp.log(maxval)))
 
 
 def exp_uniform(rng, minval, maxval):
@@ -50,9 +48,7 @@ def exp_uniform(rng, minval, maxval):
     Samples from a uniform distribution in exp space, meaning values close to maxval
     are sampled more densely.
     """
-    return jnp.log(
-        jax.random.uniform(rng, minval=jnp.exp(minval), maxval=jnp.exp(maxval))
-    )
+    return jnp.log(jax.random.uniform(rng, minval=jnp.exp(minval), maxval=jnp.exp(maxval)))
 
 
 def sample_config_dict(rng):

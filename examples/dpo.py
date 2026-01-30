@@ -12,13 +12,8 @@ from rejax import PPO
 
 def dpo_drift(ratio, advantages, alpha=2.0, beta=0.6):
     """Calculate the drift term for DPO, which is part of the loss. Details in paper."""
-    drift1 = jax.nn.relu(
-        (ratio - 1) * advantages - alpha * jnp.tanh((ratio - 1) * advantages / alpha)
-    )
-    drift2 = jax.nn.relu(
-        jnp.log(ratio) * advantages
-        - beta * jnp.tanh(jnp.log(ratio) * advantages / beta)
-    )
+    drift1 = jax.nn.relu((ratio - 1) * advantages - alpha * jnp.tanh((ratio - 1) * advantages / alpha))
+    drift2 = jax.nn.relu(jnp.log(ratio) * advantages - beta * jnp.tanh(jnp.log(ratio) * advantages / beta))
     drift = jnp.where(advantages >= 0, drift1, drift2)
     return drift
 

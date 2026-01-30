@@ -141,20 +141,14 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
             next_obs, env_state, reward, done, _ = t
 
             if self.normalize_observations:
-                obs_rms_state, next_obs = self.update_and_normalize_obs(
-                    ts.obs_rms_state, next_obs
-                )
+                obs_rms_state, next_obs = self.update_and_normalize_obs(ts.obs_rms_state, next_obs)
                 ts = ts.replace(obs_rms_state=obs_rms_state)
             if self.normalize_rewards:
-                rew_rms_state, reward = self.update_and_normalize_rew(
-                    ts.rew_rms_state, reward, done
-                )
+                rew_rms_state, reward = self.update_and_normalize_rew(ts.rew_rms_state, reward, done)
                 ts = ts.replace(rew_rms_state=rew_rms_state)
 
             # Return updated runner state and transition
-            transition = Trajectory(
-                ts.last_obs, unclipped_action, log_prob, reward, value, done
-            )
+            transition = Trajectory(ts.last_obs, unclipped_action, log_prob, reward, value, done)
             ts = ts.replace(
                 env_state=env_state,
                 last_obs=next_obs,
@@ -174,9 +168,7 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
                 + self.gamma * next_value * (1 - transition.done)
                 - transition.value
             )
-            advantage = (
-                delta + self.gamma * self.gae_lambda * (1 - transition.done) * advantage
-            )
+            advantage = delta + self.gamma * self.gae_lambda * (1 - transition.done) * advantage
             return (advantage, transition.value), advantage
 
         _, advantages = jax.lax.scan(
@@ -199,9 +191,7 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
 
             # Calculate actor loss
             ratio = jnp.exp(log_prob - batch.trajectories.log_prob)
-            advantages = (batch.advantages - batch.advantages.mean()) / (
-                batch.advantages.std() + 1e-8
-            )
+            advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
             clipped_ratio = jnp.clip(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
             pi_loss1 = ratio * advantages
             pi_loss2 = clipped_ratio * advantages
@@ -214,9 +204,9 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
     def update_critic(self, ts, batch):
         def critic_loss_fn(params):
             value = self.critic.apply(params, batch.trajectories.obs)
-            value_pred_clipped = batch.trajectories.value + (
-                value - batch.trajectories.value
-            ).clip(-self.clip_eps, self.clip_eps)
+            value_pred_clipped = batch.trajectories.value + (value - batch.trajectories.value).clip(
+                -self.clip_eps, self.clip_eps
+            )
             value_losses = jnp.square(value - batch.targets)
             value_losses_clipped = jnp.square(value_pred_clipped - batch.targets)
             value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()

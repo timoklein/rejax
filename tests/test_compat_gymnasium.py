@@ -41,10 +41,7 @@ class TestGymnasiumCompat(unittest.TestCase):
                     self.assertEqual(obs.dtype, obs_space.dtype)
                     self.assertEqual(obs.shape, obs_space.shape)
                 except Exception as e:
-                    self.fail(
-                        f"Failed to get obs space for {env_name}: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                    self.fail(f"Failed to get obs space for {env_name}: {type(e).__name__}: {e}")
 
                 # Test action space and sampling
                 try:
@@ -53,17 +50,12 @@ class TestGymnasiumCompat(unittest.TestCase):
                     self.assertEqual(action.dtype, action_space.dtype)
                     self.assertEqual(action.shape, action_space.shape)
                 except Exception as e:
-                    self.fail(
-                        f"Failed to sample action for {env_name}: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                    self.fail(f"Failed to sample action for {env_name}: {type(e).__name__}: {e}")
 
                 # Test stepping
                 for step in range(10):
                     try:
-                        obs, state, reward, done, _info = jitted_step(
-                            rng, state, action, params
-                        )
+                        obs, state, reward, done, _info = jitted_step(rng, state, action, params)
 
                         # Check types and shapes
                         self.assertEqual(obs.dtype, obs_space.dtype)
@@ -76,10 +68,7 @@ class TestGymnasiumCompat(unittest.TestCase):
                             break
 
                     except Exception as e:
-                        self.fail(
-                            f"Failed to step {env_name} at step {step}: "
-                            f"{type(e).__name__}: {e}"
-                        )
+                        self.fail(f"Failed to step {env_name} at step {step}: {type(e).__name__}: {e}")
 
                     # Sample new action for next step
                     action = action_space.sample(rng)

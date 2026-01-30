@@ -46,24 +46,26 @@ iqn:
   env: CartPole-v1
   agent_kwargs:
     activation: swish
-  num_envs: 1
+  num_envs: 10              # Increased from 1 for faster data collection
   buffer_size: 100_000
-  fill_buffer: 1000
-  batch_size: 1  # The original paper had no minibatches
+  fill_buffer: 5_000        # Increased from 1000 for better initial diversity
+  batch_size: 64            # Increased from 1 - batch_size=1 causes extreme instability!
   num_tau_samples: 64
   num_tau_prime_samples: 64
   learning_rate: 0.0003
-  num_epochs: 1
+  num_epochs: 5             # Increased from 1 for more updates per iteration
   total_timesteps: 100_000
-  eval_freq: 5000
+  eval_freq: 5_000
   target_update_freq: 1
-  polyak: 0.99
+  polyak: 0.95              # Faster target updates (was 0.99) for better stability
   kappa: 1.0
   eps_start: 1
   eps_end: 0.01
   exploration_fraction: 0.5
   gamma: 0.99
   normalize_observations: false
+  # Note: Original paper used reasonable batch sizes (~32), not batch_size=1
+  # The "no minibatches" refers to architecture, not training procedure
 
 sac:
   env: CartPole-v1

@@ -24,9 +24,7 @@ class TestRewardNormalization(unittest.TestCase):
         mixin.__dict__["reward_normalization_discount"] = gamma
 
         def complicated_reward_fn(i, rng):
-            return 10 * (i - 5) + i**2 * jax.numpy.sin(i) * jax.random.normal(
-                rng, (num_envs,)
-            )
+            return 10 * (i - 5) + i**2 * jax.numpy.sin(i) * jax.random.normal(rng, (num_envs,))
 
         def update(ep_state):
             rng, rng_reward = jax.random.split(ep_state.rng)
@@ -42,9 +40,7 @@ class TestRewardNormalization(unittest.TestCase):
 
         rng = jax.random.PRNGKey(0)
         rms_state = mixin.initialize_reward_rms_state(rng)["rew_rms_state"]
-        ep_state = EpisodeState(
-            rng, rms_state, jax.numpy.zeros(num_envs), jax.numpy.zeros(num_envs)
-        )
+        ep_state = EpisodeState(rng, rms_state, jax.numpy.zeros(num_envs), jax.numpy.zeros(num_envs))
 
         new_ep_state = jax.lax.fori_loop(0, 300, lambda _, s: update(s)[0], ep_state)
         ep_state = ep_state._replace(rms_state=new_ep_state.rms_state)

@@ -79,16 +79,12 @@ class GaussianPolicy(nn.Module):
     def setup(self):
         self.features = MLP(self.hidden_layer_sizes, self.activation)
         self.action_mean = nn.Dense(self.action_dim)
-        self.action_log_std = self.param(
-            "action_log_std", constant(0.0), (self.action_dim,)
-        )
+        self.action_log_std = self.param("action_log_std", constant(0.0), (self.action_dim,))
 
     def _action_dist(self, obs):
         features = self.features(obs)
         action_mean = self.action_mean(features)
-        return distrax.MultivariateNormalDiag(
-            loc=action_mean, scale_diag=jnp.exp(self.action_log_std)
-        )
+        return distrax.MultivariateNormalDiag(loc=action_mean, scale_diag=jnp.exp(self.action_log_std))
 
     def __call__(self, obs, rng):
         action_dist = self._action_dist(obs)
@@ -138,13 +134,9 @@ class SquashedGaussianPolicy(nn.Module):
         features = self.features(obs)
         action_mean = self.action_mean(features)
         action_log_std = self.action_log_std(features)
-        action_log_std = jnp.clip(
-            action_log_std, *self.log_std_range
-        )  # TODO: tanh transform?
+        action_log_std = jnp.clip(action_log_std, *self.log_std_range)  # TODO: tanh transform?
 
-        return distrax.MultivariateNormalDiag(
-            loc=action_mean, scale_diag=jnp.exp(action_log_std)
-        )
+        return distrax.MultivariateNormalDiag(loc=action_mean, scale_diag=jnp.exp(action_log_std))
 
     def __call__(self, obs, rng):
         action_dist = self._action_dist(obs)

@@ -95,14 +95,10 @@ class SAC(
 
         rng_critic = jax.random.split(rng_critic, self.num_critics)
         if self.discrete:
-            critic_params = jax.vmap(self.critic.init, in_axes=(0, None))(
-                rng_critic, obs_ph
-            )
+            critic_params = jax.vmap(self.critic.init, in_axes=(0, None))(rng_critic, obs_ph)
         else:
             act_ph = jnp.empty((1, *self.env.action_space(self.env_params).shape))
-            critic_params = jax.vmap(self.critic.init, in_axes=(0, None, None))(
-                rng_critic, obs_ph, act_ph
-            )
+            critic_params = jax.vmap(self.critic.init, in_axes=(0, None, None))(rng_critic, obs_ph, act_ph)
 
         tx = optax.chain(
             optax.clip(self.max_grad_norm),
@@ -143,32 +139,23 @@ class SAC(
                     next_obs=self.normalize_obs(ts.obs_rms_state, minibatch.next_obs),
                 )
             if self.normalize_rewards:
-                minibatch = minibatch._replace(
-                    reward=self.normalize_rew(ts.rew_rms_state, minibatch.reward)
-                )
+                minibatch = minibatch._replace(reward=self.normalize_rew(ts.rew_rms_state, minibatch.reward))
 
             # Update networks
             ts = self.update(ts, minibatch)
             return ts
 
         def do_updates(ts):
-            return jax.lax.fori_loop(
-                0, self.num_epochs, lambda _, ts: update_iteration(ts), ts
-            )
+            return jax.lax.fori_loop(0, self.num_epochs, lambda _, ts: update_iteration(ts), ts)
 
         start_training = ts.global_step > self.fill_buffer
         ts = jax.lax.cond(start_training, lambda: do_updates(ts), lambda: ts)
 
         # Update target network
         if self.target_update_freq == 1:
-            target_params = self.polyak_update(
-                ts.critic_ts.params, ts.critic_target_params
-            )
+            target_params = self.polyak_update(ts.critic_ts.params, ts.critic_target_params)
         else:
-            update_target_params = (
-                ts.global_step % self.target_update_freq
-                <= old_global_step % self.target_update_freq
-            )
+            update_target_params = ts.global_step % self.target_update_freq <= old_global_step % self.target_update_freq
             target_params = jax.tree.map(
                 lambda q, qt: jax.lax.select(update_target_params, q, qt),
                 self.polyak_update(ts.critic_ts.params, ts.critic_target_params),
@@ -188,9 +175,7 @@ class SAC(
             else:
                 last_obs = ts.last_obs
 
-            actions = self.actor.apply(
-                ts.actor_ts.params, last_obs, rng_action, method="act"
-            )
+            actions = self.actor.apply(ts.actor_ts.params, last_obs, rng_action, method="act")
             return actions
 
         actions = sample_policy(rng_action)
@@ -198,17 +183,11 @@ class SAC(
         rng, rng_steps = jax.random.split(ts.rng)
         ts = ts.replace(rng=rng)
         rng_steps = jax.random.split(rng_steps, self.num_envs)
-        next_obs, env_state, rewards, dones, _ = self.vmap_step(
-            rng_steps, ts.env_state, actions, self.env_params
-        )
+        next_obs, env_state, rewards, dones, _ = self.vmap_step(rng_steps, ts.env_state, actions, self.env_params)
         if self.normalize_observations:
-            ts = ts.replace(
-                obs_rms_state=self.update_obs_rms(ts.obs_rms_state, next_obs)
-            )
+            ts = ts.replace(obs_rms_state=self.update_obs_rms(ts.obs_rms_state, next_obs))
         if self.normalize_rewards:
-            ts = ts.replace(
-                rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones)
-            )
+            ts = ts.replace(rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones))
 
         minibatch = Minibatch(
             obs=ts.last_obs,
@@ -231,16 +210,12 @@ class SAC(
 
         def actor_loss_fn(params):
             if self.discrete:
-                logprob = jnp.log(
-                    self.actor.apply(params, mb.obs, method="_action_dist").probs
-                )
+                logprob = jnp.log(self.actor.apply(params, mb.obs, method="_action_dist").probs)
                 qs = self.vmap_critic(ts.critic_ts.params, mb.obs)
                 loss_pi = alpha * logprob - qs.min(axis=0)
                 loss_pi = jnp.sum(jnp.exp(logprob) * loss_pi, axis=1)
             else:
-                action, logprob = self.actor.apply(
-                    params, mb.obs, action_rng, method="action_log_prob"
-                )
+                action, logprob = self.actor.apply(params, mb.obs, action_rng, method="action_log_prob")
                 qs = self.vmap_critic(ts.critic_ts.params, mb.obs, action)
                 loss_pi = alpha * logprob - qs.min(axis=0)
             return loss_pi.mean(), logprob
@@ -257,9 +232,7 @@ class SAC(
         def critic_loss_fn(params):
             # Calculate target without gradient wrt `params`
             if self.discrete:
-                action_dist = self.actor.apply(
-                    ts.actor_ts.params, mb.next_obs, method="_action_dist"
-                )
+                action_dist = self.actor.apply(ts.actor_ts.params, mb.next_obs, method="_action_dist")
                 logprob = jnp.log(action_dist.probs)
                 qs = self.vmap_critic(ts.critic_target_params, mb.next_obs)
                 q_target = jnp.min(qs, axis=0) - alpha * logprob

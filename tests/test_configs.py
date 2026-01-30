@@ -28,10 +28,7 @@ class TestConfigs(unittest.TestCase):
                         algo_cls = get_algo(algo)
                         algo_cls.create(**config)
                     except Exception as e:
-                        self.fail(
-                            f"Failed to create {algo} with config '{config_path}': "
-                            f"{type(e).__name__}: {e!s}"
-                        )
+                        self.fail(f"Failed to create {algo} with config '{config_path}': {type(e).__name__}: {e!s}")
 
     def test_create_does_not_modify_config(self) -> None:
         for config_path, configs_env in self.configs.items():
@@ -45,7 +42,4 @@ class TestConfigs(unittest.TestCase):
                         algo_cls.create(**config)
                         self.assertEqual(config, original_config)
                     except Exception as e:
-                        self.fail(
-                            f"Config '{config_path}' for {algo} has been modified: "
-                            f"{type(e).__name__}: {e!s}"
-                        )
+                        self.fail(f"Config '{config_path}' for {algo} has been modified: {type(e).__name__}: {e!s}")

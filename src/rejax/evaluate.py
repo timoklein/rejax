@@ -27,9 +27,7 @@ def evaluate_single(
     def step(state):
         rng, rng_act, rng_step = jax.random.split(state.rng, 3)
         action = act(state.last_obs, rng_act)
-        obs, env_state, reward, done, _ = env.step(
-            rng_step, state.env_state, action, env_params
-        )
+        obs, env_state, reward, done, _ = env.step(rng_step, state.env_state, action, env_params)
         state = EvalState(
             rng=rng,
             env_state=env_state,
@@ -44,9 +42,7 @@ def evaluate_single(
     obs, env_state = env.reset(rng_reset, env_params)
     state = EvalState(rng_eval, env_state, obs)
     state = jax.lax.while_loop(
-        lambda s: jnp.logical_and(
-            s.length < max_steps_in_episode, jnp.logical_not(s.done)
-        ),
+        lambda s: jnp.logical_and(s.length < max_steps_in_episode, jnp.logical_not(s.done)),
         step,
         state,
     )

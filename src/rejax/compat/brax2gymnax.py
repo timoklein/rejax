@@ -54,9 +54,7 @@ class Brax2GymnaxEnv(GymnaxEnv):
 
     def observation_space(self, params):
         # All brax evironments have observation limit of -inf to inf
-        return spaces.Box(
-            low=-jnp.inf, high=jnp.inf, shape=(self.env.observation_size,)
-        )
+        return spaces.Box(low=-jnp.inf, high=jnp.inf, shape=(self.env.observation_size,))
 
     @property
     def num_actions(self) -> int:

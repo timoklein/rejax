@@ -43,9 +43,7 @@ class FloatObsWrapper(environment.Environment):
         return obs, state, reward, done, info
 
     @partial(jax.jit, static_argnums=(0,))
-    def reset(
-        self, key: chex.PRNGKey, params: environment.EnvParams | None = None
-    ) -> tuple[chex.Array, environment.EnvState]:
+    def reset(self, key: chex.PRNGKey, params: environment.EnvParams | None = None) -> tuple[chex.Array, environment.EnvState]:
         obs, state = self.env.reset(key, params)
         obs = obs.astype(float)
         return obs, state

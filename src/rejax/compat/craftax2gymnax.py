@@ -6,9 +6,7 @@ from flax import struct
 def create_craftax(env_name, auto_reset=True):
     env = make_craftax_env_from_name(env_name, auto_reset=auto_reset)
     # Wrap params to add max_steps_in_episode
-    env_params = EnvParams(
-        _base=env.default_params, max_steps_in_episode=env.default_params.max_timesteps
-    )
+    env_params = EnvParams(_base=env.default_params, max_steps_in_episode=env.default_params.max_timesteps)
     return env, env_params
 
 
@@ -22,16 +20,11 @@ class EnvParams:
         try:
             return getattr(self._base, name)
         except AttributeError as err:
-            raise AttributeError(
-                f"{type(self).__name__} has no attribute {name!r}"
-            ) from err
+            raise AttributeError(f"{type(self).__name__} has no attribute {name!r}") from err
 
     def __repr__(self):
         base_repr = ", ".join(f"{k}={v!r}" for k, v in vars(self._base).items())
-        return (
-            f"{type(self).__name__}({base_repr}, "
-            f"max_steps_in_episode={self.max_steps_in_episode!r})"
-        )
+        return f"{type(self).__name__}({base_repr}, max_steps_in_episode={self.max_steps_in_episode!r})"
 
 
 # Override the replace method after the dataclass decorator runs

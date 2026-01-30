@@ -98,12 +98,7 @@ def gymnasium_space_to_gymnax_space(gymnasium_space):
     elif isinstance(gymnasium_space, gymnasium_spaces.Discrete):
         return gymnax_spaces.Discrete(gymnasium_space.n)
     elif isinstance(gymnasium_space, gymnasium_spaces.Dict):
-        return gymnax_spaces.Dict(
-            {
-                k: gymnasium_space_to_gymnax_space(v)
-                for k, v in gymnasium_space.spaces.items()
-            }
-        )
+        return gymnax_spaces.Dict({k: gymnasium_space_to_gymnax_space(v) for k, v in gymnasium_space.spaces.items()})
 
 
 def num_entries(space):
