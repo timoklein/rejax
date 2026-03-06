@@ -3,6 +3,8 @@ import unittest
 from functools import partial
 
 import jax
+from flax import nnx
+from jax import numpy as jnp
 
 from rejax import TD3
 
@@ -13,6 +15,25 @@ from .environments import (
     TestEnv4Continuous,
     TestEnv5Continuous,
 )
+
+
+def get_critics(ts, num_critics=2):
+    """Reconstruct critic networks from NNX training state."""
+    critics = []
+    for i in range(num_critics):
+        state_i = jax.tree.map(lambda x: x[i], ts.critic_state)
+        critic_opt = nnx.merge(ts.critic_graphdef, state_i)
+        critics.append(critic_opt.model)
+    return critics
+
+
+def q_fn_from_critics(critics):
+    """Create a Q-function that evaluates all critics and stacks results."""
+
+    def q_fn(obs, actions):
+        return jnp.stack([c(obs, actions) for c in critics])
+
+    return q_fn
 
 
 class TestEnvironmentsTD3(unittest.TestCase):
@@ -39,9 +60,9 @@ class TestEnvironmentsTD3(unittest.TestCase):
         actions = jax.vmap(act)(obs, rngs)
 
         actions = jax.numpy.expand_dims(actions, 1)
-        q_fn = jax.vmap(td3.critic.apply, in_axes=(0, None, None))
+        q_fn = q_fn_from_critics(get_critics(ts))
 
-        qs = q_fn(ts.critic_ts.params, obs, actions)
+        qs = q_fn(obs, actions)
         value = qs.min(axis=0)
 
         for v in value:
@@ -58,9 +79,9 @@ class TestEnvironmentsTD3(unittest.TestCase):
         obs = jax.random.uniform(rng, (10, 1), minval=-1, maxval=1)
         actions = jax.vmap(act)(obs, rngs)
         actions = jax.numpy.expand_dims(actions, 1)
-        q_fn = jax.vmap(td3.critic.apply, in_axes=(0, None, None))
+        q_fn = q_fn_from_critics(get_critics(ts))
 
-        qs = q_fn(ts.critic_ts.params, obs, actions)
+        qs = q_fn(obs, actions)
         value = qs.min(axis=0)
 
         for v, r in zip(value, obs):
@@ -71,7 +92,7 @@ class TestEnvironmentsTD3(unittest.TestCase):
         td3 = TD3.create(env=env, **self.args)
         ts, _ = self.train_fn(td3)
         act = td3.make_act(ts)
-        q_fn = jax.vmap(td3.critic.apply, in_axes=(0, None, None))
+        q_fn = q_fn_from_critics(get_critics(ts))
 
         @partial(jax.vmap, in_axes=(None, 0))
         def test_i(obs, rng):
@@ -80,7 +101,7 @@ class TestEnvironmentsTD3(unittest.TestCase):
             obs = jax.numpy.expand_dims(obs, 0)
             action = jax.numpy.expand_dims(action, 1)
 
-            qs = q_fn(ts.critic_ts.params, obs, action)
+            qs = q_fn(obs, action)
             value = qs.min(axis=0)
             return value
 
@@ -95,7 +116,7 @@ class TestEnvironmentsTD3(unittest.TestCase):
         td3 = TD3.create(env=env, **self.args)
         ts, _ = self.train_fn(td3)
         act = td3.make_act(ts)
-        q_fn = jax.vmap(td3.critic.apply, in_axes=(0, None, None))
+        q_fn = q_fn_from_critics(get_critics(ts))
 
         @partial(jax.vmap, in_axes=(None, 0))
         def test_i(obs, rng):
@@ -104,7 +125,7 @@ class TestEnvironmentsTD3(unittest.TestCase):
             obs = jax.numpy.expand_dims(obs, 0)
             action = jax.numpy.expand_dims(action, 1)
 
-            qs = q_fn(ts.critic_ts.params, obs, action)
+            qs = q_fn(obs, action)
             value = qs.min(axis=0)
             return value, action
 
@@ -120,7 +141,7 @@ class TestEnvironmentsTD3(unittest.TestCase):
         td3 = TD3.create(env=env, **self.args)
         ts, _ = self.train_fn(td3)
         act = td3.make_act(ts)
-        q_fn = jax.vmap(td3.critic.apply, in_axes=(0, None, None))
+        q_fn = q_fn_from_critics(get_critics(ts))
 
         @partial(jax.vmap, in_axes=(None, 0))
         def test_i(obs, rng):
@@ -129,7 +150,7 @@ class TestEnvironmentsTD3(unittest.TestCase):
             obs = jax.numpy.expand_dims(obs, 0)
             action = jax.numpy.expand_dims(action, 1)
 
-            qs = q_fn(ts.critic_ts.params, obs, action)
+            qs = q_fn(obs, action)
             value = qs.min(axis=0)
             return value, action.squeeze(1)
 

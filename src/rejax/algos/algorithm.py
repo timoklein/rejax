@@ -1,3 +1,5 @@
+"""Base algorithm class for RL algorithms."""
+
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict
@@ -17,12 +19,20 @@ from rejax.evaluate import evaluate
 INIT_REGISTRATION_KEY = "_rejax_registered_init"
 
 
-def register_init(func):
+def register_init(func: Callable) -> Callable:
+    """Decorator to register an initialization function for state creation."""
     setattr(func, INIT_REGISTRATION_KEY, True)
     return func
 
 
 class Algorithm(struct.PyTreeNode):
+    """Base class for RL algorithms.
+
+    This class maintains the same @register_init pattern as the Linen version,
+    but network initialization creates nnx.Module instances instead of parameter
+    dictionaries.
+    """
+
     env: Environment = struct.field(pytree_node=False)
     env_params: Any = struct.field(pytree_node=True)
     eval_callback: Callable = struct.field(pytree_node=False)
@@ -36,12 +46,20 @@ class Algorithm(struct.PyTreeNode):
     max_grad_norm: chex.Scalar = struct.field(pytree_node=True, default=jnp.inf)
 
     @classmethod
-    def create(cls, **config):
+    def create(cls, **config: Any) -> "Algorithm":
+        """Create an algorithm instance from configuration.
+
+        Args:
+            **config: Configuration dictionary including env, env_params, and algorithm-specific params
+
+        Returns:
+            Configured algorithm instance
+        """
         config = deepcopy(config)
         env, env_params = cls.create_env(config)
         agent = cls.create_agent(config, env, env_params)
 
-        def eval_callback(algo, ts, rng):
+        def eval_callback(algo: "Algorithm", ts: Any, rng: chex.PRNGKey) -> dict:
             act = algo.make_act(ts)
             max_steps = algo.env_params.max_steps_in_episode
             return evaluate(act, rng, env, env_params, 128, max_steps)
@@ -55,6 +73,14 @@ class Algorithm(struct.PyTreeNode):
         )
 
     def init_state(self, rng: chex.PRNGKey) -> Any:
+        """Initialize training state by calling all registered init functions.
+
+        Args:
+            rng: RNG key for initialization
+
+        Returns:
+            Dynamically created state PyTreeNode containing all registered state values
+        """
         state_values = {}
         for name in dir(self):
             func = getattr(self, name)
@@ -70,11 +96,27 @@ class Algorithm(struct.PyTreeNode):
         return clz(**state_values)
 
     @register_init
-    def init_base_state(self, rng: chex.PRNGKey):
+    def init_base_state(self, rng: chex.PRNGKey) -> dict[str, chex.PRNGKey]:
+        """Initialize base state with RNG key.
+
+        Args:
+            rng: RNG key
+
+        Returns:
+            Dictionary with 'rng' key
+        """
         return {"rng": rng}
 
     @classmethod
-    def create_env(cls, config):
+    def create_env(cls, config: dict[str, Any]) -> tuple[Environment, Any]:
+        """Create environment from configuration.
+
+        Args:
+            config: Configuration dictionary, modified in-place
+
+        Returns:
+            Tuple of (environment, environment parameters)
+        """
         if isinstance(config["env"], str):
             env, env_params = create(config.pop("env"), **config.pop("env_params", {}))
         else:
@@ -83,29 +125,44 @@ class Algorithm(struct.PyTreeNode):
         return env, env_params
 
     @classmethod
-    def create_agent(cls, config, env, env_params):
+    def create_agent(cls, config: dict[str, Any], env: Environment, env_params: Any) -> dict:
+        """Create agent networks and configuration.
+
+        Args:
+            config: Configuration dictionary
+            env: Environment instance
+            env_params: Environment parameters
+
+        Returns:
+            Dictionary with network modules and agent configuration
+        """
         raise NotImplementedError
 
     @property
-    def discrete(self):
+    def discrete(self) -> bool:
+        """Whether the action space is discrete."""
         action_space = self.env.action_space(self.env_params)
         return isinstance(action_space, gymnax.environments.spaces.Discrete)
 
     @property
-    def action_dim(self):
+    def action_dim(self) -> int:
+        """Dimension of the action space."""
         action_space = self.env.action_space(self.env_params)
         if self.discrete:
             return action_space.n
         return jnp.prod(jnp.array(action_space.shape))
 
     @property
-    def action_space(self):
+    def action_space(self) -> Any:
+        """Action space of the environment."""
         return self.env.action_space(self.env_params)
 
     @property
-    def obs_space(self):
+    def obs_space(self) -> Any:
+        """Observation space of the environment."""
         return self.env.observation_space(self.env_params)
 
     @property
-    def config(self):
+    def config(self) -> dict[str, Any]:
+        """Configuration dictionary."""
         return asdict(self)

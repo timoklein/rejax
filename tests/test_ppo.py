@@ -2,6 +2,7 @@ import typing
 import unittest
 
 import jax
+from flax import nnx
 
 from rejax import PPO
 
@@ -17,6 +18,12 @@ from .environments import (
     TestEnv5Continuous,
     TestEnv5Discrete,
 )
+
+
+def get_critic(ts):
+    """Reconstruct critic network from NNX training state."""
+    critic_optimizer = nnx.merge(ts.critic_graphdef, ts.critic_state)
+    return critic_optimizer.model
 
 
 class TestEnvironmentsPPO(unittest.TestCase):
@@ -38,7 +45,8 @@ class TestEnvironmentsPPO(unittest.TestCase):
             with self.subTest(discrete=bool(discrete)):
                 ppo = PPO.create(env=env, **self.args)
                 ts, _ = self.train_fn(ppo)
-                value = ppo.critic.apply(ts.critic_ts.params, jax.numpy.array([0]))
+                critic = get_critic(ts)
+                value = critic(jax.numpy.array([0]))
                 self.assertAlmostEqual(value, 1.0, delta=0.1)
 
     def test_env2(self):
@@ -49,7 +57,8 @@ class TestEnvironmentsPPO(unittest.TestCase):
 
                 obs = jax.numpy.array([[-1], [1]])
                 rew = obs
-                value = ppo.critic.apply(ts.critic_ts.params, obs)
+                critic = get_critic(ts)
+                value = critic(obs)
 
                 for v, r in zip(value, rew):
                     self.assertAlmostEqual(v, r, delta=0.1)
@@ -62,7 +71,8 @@ class TestEnvironmentsPPO(unittest.TestCase):
 
                 obs = jax.numpy.array([[-1], [1]])
                 rew = [1 * ppo.gamma, 1]
-                value = ppo.critic.apply(ts.critic_ts.params, obs)
+                critic = get_critic(ts)
+                value = critic(obs)
 
                 for v, r in zip(value, rew):
                     self.assertAlmostEqual(v, r, delta=0.1)
@@ -74,7 +84,8 @@ class TestEnvironmentsPPO(unittest.TestCase):
                 ts, _ = self.train_fn(ppo)
 
                 best_action = jax.numpy.array(1.0 if discrete else 2.0)
-                value = ppo.critic.apply(ts.critic_ts.params, jax.numpy.array([0]))
+                critic = get_critic(ts)
+                value = critic(jax.numpy.array([0]))
                 self.assertAlmostEqual(value, best_action, delta=0.1)
 
                 act = ppo.make_act(ts)
@@ -97,7 +108,8 @@ class TestEnvironmentsPPO(unittest.TestCase):
                     obs = 2 * jax.random.bernoulli(rng, shape=(10, 1)) - 1
 
                 if not discrete:
-                    value = ppo.critic.apply(ts.critic_ts.params, obs)
+                    critic = get_critic(ts)
+                    value = critic(obs)
                     for v in value:
                         self.assertAlmostEqual(v, 0.0, delta=0.1)
 

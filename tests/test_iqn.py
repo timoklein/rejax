@@ -2,6 +2,7 @@ import typing
 import unittest
 
 import jax
+from flax import nnx
 
 from rejax import IQN
 
@@ -12,6 +13,12 @@ from .environments import (
     TestEnv4Discrete,
     TestEnv5Discrete,
 )
+
+
+def get_q_network(ts):
+    """Reconstruct Q-network from NNX training state."""
+    q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
+    return q_optimizer.model
 
 
 class TestEnvironmentsIQN(unittest.TestCase):
@@ -31,7 +38,8 @@ class TestEnvironmentsIQN(unittest.TestCase):
         env = TestEnv1Discrete()
         iqn = IQN.create(env=env, **self.args)
         ts, _ = self.train_fn(iqn)
-        value = iqn.agent.apply(ts.q_ts.params, jax.numpy.array([0]), self.rng, method="q")
+        q_network = get_q_network(ts)
+        value = q_network.q(jax.numpy.array([0]), self.rng)
         self.assertAlmostEqual(value, 1.0, delta=0.1)
 
     def test_env2(self):
@@ -41,7 +49,8 @@ class TestEnvironmentsIQN(unittest.TestCase):
 
         obs = jax.numpy.array([[-1], [1]])
         rew = obs
-        value = iqn.agent.apply(ts.q_ts.params, obs, self.rng, method="q")
+        q_network = get_q_network(ts)
+        value = q_network.q(obs, self.rng)
 
         for v, r in zip(value, rew):
             self.assertAlmostEqual(v, r, delta=0.1)
@@ -53,7 +62,8 @@ class TestEnvironmentsIQN(unittest.TestCase):
 
         obs = jax.numpy.array([[-1], [1]])
         rew = [1 * iqn.gamma, 1]
-        value = iqn.agent.apply(ts.q_ts.params, obs, self.rng, method="q")
+        q_network = get_q_network(ts)
+        value = q_network.q(obs, self.rng)
 
         for v, r in zip(value, rew):
             self.assertAlmostEqual(v, r, delta=0.1)
@@ -64,7 +74,8 @@ class TestEnvironmentsIQN(unittest.TestCase):
         ts, _ = self.train_fn(iqn)
 
         best_action = 1
-        value = iqn.agent.apply(ts.q_ts.params, jax.numpy.array([0]), self.rng, method="q")
+        q_network = get_q_network(ts)
+        value = q_network.q(jax.numpy.array([0]), self.rng)
         self.assertEqual(value.argmax(), best_action)
 
         act = iqn.make_act(ts)

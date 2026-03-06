@@ -14,7 +14,7 @@ from rejax.algos.mixins import (
     TargetNetworkMixin,
 )
 from rejax.buffers import Minibatch
-from rejax.networks import DiscreteQNetwork, DuelingQNetwork, EpsilonGreedyPolicy
+from rejax.networks_linen import DiscreteQNetwork, DuelingQNetwork, EpsilonGreedyPolicy
 
 
 class DQN(
