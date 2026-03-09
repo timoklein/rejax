@@ -66,15 +66,7 @@ class TD3(
     policy_delay: int = struct.field(pytree_node=False, default=2)
 
     def make_act(self, ts: Any) -> Callable:
-        """Create an action selection function for evaluation.
-
-        Args:
-            ts: Training state containing network states
-
-        Returns:
-            Function that takes (obs, rng) and returns an action
-        """
-        # Reconstruct optimizer and extract actor network
+        """Create an action selection function for evaluation."""
         actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
         actor = actor_optimizer.model
 
@@ -90,20 +82,10 @@ class TD3(
 
     @classmethod
     def create_agent(cls, config: dict, env: Environment, env_params: Any) -> dict:
-        """Create actor and critic network configurations.
-
-        Args:
-            config: Configuration dictionary, modified in-place
-            env: Environment instance
-            env_params: Environment parameters
-
-        Returns:
-            Dictionary with network class types and kwargs
-        """
+        """Create actor and critic network configurations."""
         obs_space = env.observation_space(env_params)
         action_space = env.action_space(env_params)
 
-        # Get observation dimension
         obs_shape = obs_space.shape
         in_features = int(np.prod(obs_shape))
 
@@ -111,14 +93,10 @@ class TD3(
         actor_kwargs = config.pop("actor_kwargs", {})
         activation = actor_kwargs.pop("activation", "swish")
         actor_kwargs["activation"] = getattr(nnx, activation)
-
         hidden_layer_sizes = actor_kwargs.pop("hidden_layer_sizes", (64, 64))
         actor_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
 
-        action_range = (
-            float(action_space.low),
-            float(action_space.high),
-        )
+        action_range = (float(action_space.low), float(action_space.high))
         action_dim = int(np.prod(action_space.shape))
 
         actor_cls = DeterministicPolicy
@@ -133,7 +111,6 @@ class TD3(
         critic_kwargs = config.pop("critic_kwargs", {})
         activation = critic_kwargs.pop("activation", "swish")
         critic_kwargs["activation"] = getattr(nnx, activation)
-
         hidden_layer_sizes = critic_kwargs.pop("hidden_layer_sizes", (64, 64))
         critic_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
 
@@ -153,54 +130,33 @@ class TD3(
 
     @register_init
     def initialize_network_params(self, rng: chex.PRNGKey) -> dict:
-        """Initialize actor and critic networks with optimizers.
-
-        Args:
-            rng: RNG key for network initialization
-
-        Returns:
-            Dictionary with network graphdefs, states, and target params
-        """
+        """Initialize actor and critic networks with optimizers."""
         rng, rng_actor, rng_critic = jax.random.split(rng, 3)
 
-        # Create actor network
         actor = self.actor_cls(**self.actor_kwargs, rngs=nnx.Rngs(rng_actor))
 
-        # Create optimizer
         tx = optax.chain(
             optax.clip_by_global_norm(self.max_grad_norm),
             optax.adam(learning_rate=self.learning_rate),
         )
 
-        # Create actor optimizer
         actor_optimizer = nnx.Optimizer(actor, tx)
 
-        # Create vmapped critics
-        # We need to create critics individually, then stack their states
         rng_critic = jax.random.split(rng_critic, self.num_critics)
-
-        # Create individual critics
         critics_list = []
         for i in range(self.num_critics):
             critic = self.critic_cls(**self.critic_kwargs, rngs=nnx.Rngs(rng_critic[i]))
             critics_list.append(critic)
 
-        # Create optimizers for each critic
         critic_optimizers = [nnx.Optimizer(critic, tx) for critic in critics_list]
 
-        # Split each optimizer to get graphdef and state
-        # All critics share the same graphdef (same architecture)
         critic_graphdefs_states = [nnx.split(opt) for opt in critic_optimizers]
-        critic_graphdef = critic_graphdefs_states[0][0]  # Use first graphdef (all same)
+        critic_graphdef = critic_graphdefs_states[0][0]
         critic_states = [gs[1] for gs in critic_graphdefs_states]
-
-        # Stack the states to enable vmapped operations
         critic_state = jax.tree.map(lambda *args: jnp.stack(args), *critic_states)
 
-        # Split actor optimizer into graphdef and state
         actor_graphdef, actor_state = nnx.split(actor_optimizer)
 
-        # Create target networks by copying the current states
         actor_target_state = actor_state
         critic_target_state = critic_state
 
@@ -213,16 +169,18 @@ class TD3(
             "critic_target_state": critic_target_state,
         }
 
+    def _unstack_and_merge_critics(self, graphdef, stacked_state):
+        """Unstack stacked critic states and merge each into a live module."""
+        states = [jax.tree.map(lambda x: x[i], stacked_state) for i in range(self.num_critics)]
+        return [nnx.merge(graphdef, s) for s in states]
+
+    def _split_and_stack_critics(self, critics):
+        """Split live critic modules and stack their states."""
+        states = [nnx.split(c)[1] for c in critics]
+        return jax.tree.map(lambda *args: jnp.stack(args), *states)
+
     def train(self, rng: chex.PRNGKey = None, train_state: Any = None) -> tuple:
-        """Train the agent.
-
-        Args:
-            rng: RNG key for training
-            train_state: Optional pre-initialized training state
-
-        Returns:
-            Tuple of (final_train_state, evaluation_results)
-        """
+        """Train the agent."""
         if train_state is None and rng is None:
             raise ValueError("Either train_state or rng must be provided")
 
@@ -232,7 +190,6 @@ class TD3(
             initial_evaluation = self.eval_callback(self, ts, ts.rng)
 
         def eval_iteration(ts: Any, unused: None) -> tuple:
-            # Run a few training iterations
             steps_per_train_it = self.num_envs * self.policy_delay
             num_train_its = np.ceil(self.eval_freq / steps_per_train_it).astype(int)
             ts = jax.lax.fori_loop(
@@ -241,8 +198,6 @@ class TD3(
                 lambda _, ts: self.train_iteration(ts),
                 ts,
             )
-
-            # Run evaluation
             return ts, self.eval_callback(self, ts, ts.rng)
 
         ts, evaluation = jax.lax.scan(
@@ -262,46 +217,68 @@ class TD3(
         return ts, evaluation
 
     def train_iteration(self, ts: Any) -> Any:
-        """Run one training iteration.
-
-        Args:
-            ts: Training state
-
-        Returns:
-            Updated training state
-        """
+        """Run one training iteration."""
         old_global_step = ts.global_step
+
+        # Merge once at top
+        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
+        actor_target = nnx.merge(ts.actor_graphdef, ts.actor_target_state)
+        critic_opts = self._unstack_and_merge_critics(ts.critic_graphdef, ts.critic_state)
+        critic_targets = self._unstack_and_merge_critics(ts.critic_graphdef, ts.critic_target_state)
+
         placeholder_minibatch = jax.tree.map(
             lambda sdstr: jnp.empty((self.num_epochs, *sdstr.shape), sdstr.dtype),
             ts.replay_buffer.sample(self.batch_size, jax.random.PRNGKey(0)),
         )
-        ts, minibatch = jax.lax.fori_loop(
+
+        # actor_optimizer.model and actor_target.model are read-only inside train_critic
+        def policy_delay_body(_, state):
+            ts, minibatch, c_opts, c_tgts = state
+            ts, minibatch, c_opts, c_tgts = self.train_critic(ts, actor_optimizer.model, actor_target.model, c_opts, c_tgts)
+            return (ts, minibatch, c_opts, c_tgts)
+
+        ts, minibatch, critic_opts, critic_targets = nnx.fori_loop(
             0,
             self.policy_delay,
-            lambda _, ts_mb: self.train_critic(ts_mb[0]),
-            (ts, placeholder_minibatch),
+            policy_delay_body,
+            (ts, placeholder_minibatch, critic_opts, critic_targets),
         )
-        ts = self.train_policy(ts, minibatch, old_global_step)
-        return ts
+        ts = self.train_policy(ts, minibatch, actor_optimizer, actor_target, critic_opts, critic_targets, old_global_step)
 
-    def train_critic(self, ts: Any) -> tuple:
+        # Split once at bottom
+        _, actor_state = nnx.split(actor_optimizer)
+        _, actor_target_state = nnx.split(actor_target)
+        critic_state = self._split_and_stack_critics(critic_opts)
+        critic_target_state = self._split_and_stack_critics(critic_targets)
+        return ts.replace(
+            actor_state=actor_state,
+            actor_target_state=actor_target_state,
+            critic_state=critic_state,
+            critic_target_state=critic_target_state,
+        )
+
+    def train_critic(
+        self, ts: Any, actor: nnx.Module, actor_target: nnx.Module, critic_opts: list, critic_targets: list
+    ) -> tuple:
         """Collect transitions and update critics.
 
-        Args:
-            ts: Training state
-
-        Returns:
-            Tuple of (updated_ts, minibatches)
+        Returns (ts, minibatches, critic_opts, critic_targets) with critics threaded
+        through NNX lifted transforms to avoid captured-mutable-module errors.
         """
         start_training = ts.global_step > self.fill_buffer
 
-        # Collect transition
         uniform = jnp.logical_not(start_training)
-        ts, transitions = self.collect_transitions(ts, uniform=uniform)
+        ts, transitions = self.collect_transitions(ts, actor, uniform=uniform)
         ts = ts.replace(replay_buffer=ts.replay_buffer.extend(transitions))
 
-        def update_iteration(ts: Any, unused: None) -> tuple:
-            # Sample minibatch
+        placeholder_minibatch = jax.tree.map(
+            lambda sdstr: jnp.empty((self.num_epochs, *sdstr.shape), sdstr.dtype),
+            ts.replay_buffer.sample(self.batch_size, jax.random.PRNGKey(0)),
+        )
+
+        # actor_target is read-only inside update_critic (used for target Q computation)
+        def update_body(i, state):
+            ts, c_opts, c_tgts, minibatches = state
             rng, rng_sample = jax.random.split(ts.rng)
             ts = ts.replace(rng=rng)
             minibatch = ts.replay_buffer.sample(self.batch_size, rng_sample)
@@ -313,150 +290,95 @@ class TD3(
             if self.normalize_rewards:
                 minibatch = minibatch._replace(reward=self.normalize_rew(ts.rew_rms_state, minibatch.reward))
 
-            # Update network
-            ts = self.update_critic(ts, minibatch)
-            return ts, minibatch
+            self.update_critic(ts, minibatch, actor_target, c_opts, c_tgts)
+            minibatches = jax.tree.map(lambda mb, m: mb.at[i].set(m), minibatches, minibatch)
+            return (ts, c_opts, c_tgts, minibatches)
 
-        def do_updates(ts: Any) -> tuple:
-            return jax.lax.scan(update_iteration, ts, None, self.num_epochs)
-
-        placeholder_minibatch = jax.tree.map(
-            lambda sdstr: jnp.empty((self.num_epochs, *sdstr.shape), sdstr.dtype),
-            ts.replay_buffer.sample(self.batch_size, jax.random.PRNGKey(0)),
-        )
-        ts, minibatches = jax.lax.cond(
-            start_training,
-            do_updates,
-            lambda ts: (ts, placeholder_minibatch),
-            ts,
-        )
-        return ts, minibatches
-
-    def train_policy(self, ts: Any, minibatches: Any, old_global_step: int) -> Any:
-        """Update actor and target networks.
-
-        Args:
-            ts: Training state
-            minibatches: Collected minibatches for policy update
-            old_global_step: Global step before critic updates
-
-        Returns:
-            Updated training state
-        """
-
-        def do_updates(ts: Any) -> Any:
-            ts, _ = jax.lax.scan(
-                lambda ts, minibatch: (self.update_actor(ts, minibatch), None),
-                ts,
-                minibatches,
+        def do_updates(ts, c_opts, c_tgts):
+            ts, c_opts, c_tgts, minibatches = nnx.fori_loop(
+                0, self.num_epochs, update_body, (ts, c_opts, c_tgts, placeholder_minibatch)
             )
-            return ts
+            return ts, c_opts, c_tgts, minibatches
+
+        def no_updates(ts, c_opts, c_tgts):
+            return ts, c_opts, c_tgts, placeholder_minibatch
+
+        ts, critic_opts, critic_targets, minibatches = nnx.cond(
+            start_training, do_updates, no_updates, ts, critic_opts, critic_targets
+        )
+        return ts, minibatches, critic_opts, critic_targets
+
+    def train_policy(
+        self,
+        ts: Any,
+        minibatches: Any,
+        actor_optimizer: nnx.Optimizer,
+        actor_target: nnx.Module,
+        critic_opts: list,
+        critic_targets: list,
+        old_global_step: int,
+    ) -> Any:
+        """Update actor and target networks."""
+
+        def do_updates(ts, actor_opt):
+            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+            def scan_update(carry, minibatch):
+                ts, actor_opt = carry
+                self.update_actor(minibatch, actor_opt, critic_opts)
+                return (ts, actor_opt)
+
+            ts, actor_opt = scan_update((ts, actor_opt), minibatches)
+            return (ts, actor_opt)
+
+        def no_updates(ts, actor_opt):
+            return (ts, actor_opt)
 
         start_training = ts.global_step > self.fill_buffer
-        ts = jax.lax.cond(start_training, do_updates, lambda ts: ts, ts)
+        ts, actor_optimizer = nnx.cond(start_training, do_updates, no_updates, ts, actor_optimizer)
 
         # Update target networks
         if self.target_update_freq == 1:
-            # Polyak averaging update - extract params only, update, then re-split
-            actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
-            actor_target = nnx.merge(ts.actor_graphdef, ts.actor_target_state)
-
-            # Extract only the parameters (not optimizer state)
+            # Polyak averaging
             online_actor_params = nnx.state(actor_optimizer.model, nnx.Param)
             target_actor_params = nnx.state(actor_target.model, nnx.Param)
-
-            # Apply polyak averaging to parameters
             updated_actor_params = jax.tree.map(
                 lambda online, target: self.polyak * target + (1 - self.polyak) * online,
                 online_actor_params,
                 target_actor_params,
             )
-
-            # Update target network with new parameters
             nnx.update(actor_target.model, updated_actor_params)
-            _, actor_target_state = nnx.split(actor_target)
-
-            # Same for critics - need to update each critic individually
-            critic_target_states_unstacked = [
-                jax.tree.map(lambda x: x[i], ts.critic_target_state) for i in range(self.num_critics)
-            ]
-            critic_states_unstacked = [jax.tree.map(lambda x: x[i], ts.critic_state) for i in range(self.num_critics)]
 
             for i in range(self.num_critics):
-                critic_opt = nnx.merge(ts.critic_graphdef, critic_states_unstacked[i])
-                critic_target = nnx.merge(ts.critic_graphdef, critic_target_states_unstacked[i])
-
-                online_critic_params = nnx.state(critic_opt.model, nnx.Param)
-                target_critic_params = nnx.state(critic_target.model, nnx.Param)
-
-                updated_critic_params = jax.tree.map(
+                online_params = nnx.state(critic_opts[i].model, nnx.Param)
+                target_params = nnx.state(critic_targets[i].model, nnx.Param)
+                updated_params = jax.tree.map(
                     lambda online, target: self.polyak * target + (1 - self.polyak) * online,
-                    online_critic_params,
-                    target_critic_params,
+                    online_params,
+                    target_params,
                 )
-
-                nnx.update(critic_target.model, updated_critic_params)
-                _, critic_target_states_unstacked[i] = nnx.split(critic_target)
-
-            # Re-stack critic target states
-            critic_target_state = jax.tree.map(lambda *args: jnp.stack(args), *critic_target_states_unstacked)
-
-            ts = ts.replace(
-                critic_target_state=critic_target_state,
-                actor_target_state=actor_target_state,
-            )
+                nnx.update(critic_targets[i].model, updated_params)
         else:
-            # Hard update at specified frequency
             update_target_params = ts.global_step % self.target_update_freq <= old_global_step % self.target_update_freq
 
-            def update_targets():
-                """Hard copy of current params to target params."""
-                actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
-                actor_target = nnx.merge(ts.actor_graphdef, ts.actor_target_state)
-                online_params = nnx.state(actor_optimizer.model, nnx.Param)
-                nnx.update(actor_target.model, online_params)
-                _, new_actor_target_state = nnx.split(actor_target)
-
-                # Update critics
-                critic_target_states_unstacked = [
-                    jax.tree.map(lambda x: x[i], ts.critic_target_state) for i in range(self.num_critics)
-                ]
-                critic_states_unstacked = [jax.tree.map(lambda x: x[i], ts.critic_state) for i in range(self.num_critics)]
-
+            def update_targets(actor_tgt, c_tgts):
+                online_actor_params = nnx.state(actor_optimizer.model, nnx.Param)
+                nnx.update(actor_tgt.model, online_actor_params)
                 for i in range(self.num_critics):
-                    critic_opt = nnx.merge(ts.critic_graphdef, critic_states_unstacked[i])
-                    critic_target = nnx.merge(ts.critic_graphdef, critic_target_states_unstacked[i])
-                    online_params = nnx.state(critic_opt.model, nnx.Param)
-                    nnx.update(critic_target.model, online_params)
-                    _, critic_target_states_unstacked[i] = nnx.split(critic_target)
+                    online_params = nnx.state(critic_opts[i].model, nnx.Param)
+                    nnx.update(c_tgts[i].model, online_params)
+                return (actor_tgt, c_tgts)
 
-                new_critic_target_state = jax.tree.map(lambda *args: jnp.stack(args), *critic_target_states_unstacked)
+            def no_update_targets(actor_tgt, c_tgts):
+                return (actor_tgt, c_tgts)
 
-                return new_actor_target_state, new_critic_target_state
-
-            actor_target_state, critic_target_state = jax.lax.cond(
-                update_target_params,
-                update_targets,
-                lambda: (ts.actor_target_state, ts.critic_target_state),
+            actor_target, critic_targets = nnx.cond(
+                update_target_params, update_targets, no_update_targets, actor_target, critic_targets
             )
 
-            ts = ts.replace(
-                critic_target_state=critic_target_state,
-                actor_target_state=actor_target_state,
-            )
         return ts
 
-    def collect_transitions(self, ts: Any, uniform: bool = False) -> tuple:
-        """Collect transitions from the environment.
-
-        Args:
-            ts: Training state
-            uniform: Whether to sample actions uniformly or from policy
-
-        Returns:
-            Tuple of (updated_ts, minibatch)
-        """
-        # Sample actions
+    def collect_transitions(self, ts: Any, actor: nnx.Module, uniform: bool = False) -> tuple:
+        """Collect transitions from the environment."""
         rng, rng_action = jax.random.split(ts.rng)
         ts = ts.replace(rng=rng)
 
@@ -465,10 +387,6 @@ class TD3(
             return jax.vmap(sample_fn)(jax.random.split(rng, self.num_envs))
 
         def sample_policy(rng: chex.PRNGKey) -> jax.Array:
-            # Reconstruct actor
-            actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
-            actor = actor_optimizer.model
-
             if self.normalize_observations:
                 last_obs = self.normalize_obs(ts.obs_rms_state, ts.last_obs)
             else:
@@ -481,7 +399,6 @@ class TD3(
 
         actions = jax.lax.cond(uniform, sample_uniform, sample_policy, rng_action)
 
-        # Step environment
         rng, rng_steps = jax.random.split(ts.rng)
         ts = ts.replace(rng=rng)
         rng_steps = jax.random.split(rng_steps, self.num_envs)
@@ -492,7 +409,6 @@ class TD3(
         if self.normalize_rewards:
             ts = ts.replace(rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones))
 
-        # Return minibatch and updated train state
         minibatch = Minibatch(
             obs=ts.last_obs,
             action=actions,
@@ -507,34 +423,12 @@ class TD3(
         )
         return ts, minibatch
 
-    def update_critic(self, ts: Any, minibatch: Minibatch) -> Any:
-        """Update critic networks using twin Q-learning.
+    def update_critic(
+        self, ts: Any, minibatch: Minibatch, actor_target: nnx.Module, critic_opts: list, critic_targets: list
+    ) -> None:
+        """Update critic networks. Mutates critic_opts in-place."""
+        target_critics = [opt.model for opt in critic_targets]
 
-        Args:
-            ts: Training state
-            minibatch: Minibatch of transitions
-
-        Returns:
-            Updated training state
-        """
-        # Reconstruct actor target and critic targets
-        actor_target = nnx.merge(ts.actor_graphdef, ts.actor_target_state).model
-
-        # For vmapped critics, we need to vmap the merge operation
-        def merge_critic(state):
-            """Merge a single critic state with the shared graphdef."""
-            return nnx.merge(ts.critic_graphdef, state).model
-
-        # Unstack critic states along the first axis
-        critic_states_unstacked = [jax.tree.map(lambda x: x[i], ts.critic_state) for i in range(self.num_critics)]
-        critic_target_states_unstacked = [
-            jax.tree.map(lambda x: x[i], ts.critic_target_state) for i in range(self.num_critics)
-        ]
-
-        critics = [merge_critic(s) for s in critic_states_unstacked]
-        critics_target = [merge_critic(s) for s in critic_target_states_unstacked]
-
-        # Compute target action with noise
         action = actor_target(minibatch.next_obs)
         noise = jnp.clip(
             self.target_noise * jax.random.normal(ts.rng, action.shape),
@@ -544,69 +438,29 @@ class TD3(
         action_low, action_high = self.action_space.low, self.action_space.high
         action = jnp.clip(action + noise, action_low, action_high)
 
-        # Compute target Q-values
-        qs_target = jnp.stack([critic(minibatch.next_obs, action) for critic in critics_target])
+        qs_target = jnp.stack([critic(minibatch.next_obs, action) for critic in target_critics])
         q_target = jnp.min(qs_target, axis=0)
         target = minibatch.reward + (1 - minibatch.done) * self.gamma * q_target
 
-        # Update each critic individually
-        for i, critic in enumerate(critics):
+        for critic_opt in critic_opts:
+            critic = critic_opt.model
 
             def critic_loss_fn(critic_model: nnx.Module) -> jax.Array:
                 q = critic_model(minibatch.obs, minibatch.action)
                 return optax.l2_loss(q, target).mean()
 
-            # Compute gradients for this critic
             loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
-
-            # Get optimizer for this critic
-            critic_opt = nnx.merge(ts.critic_graphdef, critic_states_unstacked[i])
             critic_opt.update(grads)
 
-            # Extract updated state
-            _, critic_states_unstacked[i] = nnx.split(critic_opt)
-
-        # Re-stack the states
-        critic_state = jax.tree.map(lambda *args: jnp.stack(args), *critic_states_unstacked)
-
-        ts = ts.replace(critic_state=critic_state)
-        return ts
-
-    def update_actor(self, ts: Any, minibatch: Minibatch) -> Any:
-        """Update actor network using deterministic policy gradient.
-
-        Args:
-            ts: Training state
-            minibatch: Minibatch of transitions
-
-        Returns:
-            Updated training state
-        """
-        # Reconstruct actor optimizer
-        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
+    def update_actor(self, minibatch: Minibatch, actor_optimizer: nnx.Optimizer, critic_opts: list) -> None:
+        """Update actor network. Mutates actor_optimizer in-place."""
         actor = actor_optimizer.model
-
-        # Reconstruct critics
-        def merge_critic(state):
-            """Merge a single critic state with the shared graphdef."""
-            return nnx.merge(ts.critic_graphdef, state).model
-
-        # Unstack critic states along the first axis
-        critic_states_unstacked = [jax.tree.map(lambda x: x[i], ts.critic_state) for i in range(self.num_critics)]
-        critics = [merge_critic(s) for s in critic_states_unstacked]
+        critics = [opt.model for opt in critic_opts]
 
         def actor_loss_fn(actor_model: nnx.Module) -> jax.Array:
             action = actor_model(minibatch.obs)
-
-            # Compute Q-value using first critic (standard for deterministic policy gradient)
-            # We could also use the minimum Q-value, but typically just use one critic
             q = critics[0](minibatch.obs, action)
             return -q.mean()
 
         loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
         actor_optimizer.update(grads)
-
-        # Re-split to extract updated state
-        _, actor_state = nnx.split(actor_optimizer)
-        ts = ts.replace(actor_state=actor_state)
-        return ts

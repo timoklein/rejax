@@ -176,18 +176,23 @@ class IQN(
         start_training = ts.global_step > self.fill_buffer
         old_global_step = ts.global_step
 
+        # Merge once at top
+        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
+        q_network = q_optimizer.model
+        q_target = nnx.merge(ts.q_target_graphdef, ts.q_target_state)
+
         # Calculate epsilon
         epsilon = self.epsilon_schedule(ts.global_step)
 
         # Collect transitions
         uniform = jnp.logical_not(start_training)
-        ts, batch = self.collect_transitions(ts, epsilon, uniform=uniform)
+        ts, batch = self.collect_transitions(ts, epsilon, q_network, uniform=uniform)
         ts = ts.replace(replay_buffer=ts.replay_buffer.extend(batch))
 
         # Perform updates to Q-network
-        def update_iteration(ts: Any) -> Any:
-            # Sample minibatch
-            rng, rng_sample = jax.random.split(ts.rng)
+        def update_iteration(_, state):
+            ts, q_opt, q_tgt = state
+            rng, rng_sample, rng_update = jax.random.split(ts.rng, 3)
             ts = ts.replace(rng=rng)
             minibatch = ts.replay_buffer.sample(self.batch_size, rng_sample)
             if self.normalize_observations:
@@ -195,23 +200,23 @@ class IQN(
                     obs=self.normalize_obs(ts.obs_rms_state, minibatch.obs),
                     next_obs=self.normalize_obs(ts.obs_rms_state, minibatch.next_obs),
                 )
+            if self.normalize_rewards:
+                minibatch = minibatch._replace(reward=self.normalize_rew(ts.rew_rms_state, minibatch.reward))
 
-            # Update network
-            ts = self.update(ts, minibatch)
-            return ts
+            self.update(minibatch, q_opt, q_tgt, rng_update)
+            return (ts, q_opt, q_tgt)
 
-        def do_updates(ts: Any) -> Any:
-            return jax.lax.fori_loop(0, self.num_epochs, lambda _, ts: update_iteration(ts), ts)
+        def do_updates(ts, q_opt, q_tgt):
+            return nnx.fori_loop(0, self.num_epochs, update_iteration, (ts, q_opt, q_tgt))
 
-        ts = jax.lax.cond(start_training, lambda: do_updates(ts), lambda: ts)
+        def no_updates(ts, q_opt, q_tgt):
+            return (ts, q_opt, q_tgt)
+
+        ts, q_optimizer, q_target = nnx.cond(start_training, do_updates, no_updates, ts, q_optimizer, q_target)
 
         # Update target network
+        online_params = nnx.state(q_network, nnx.Param)
         if self.target_update_freq == 1:
-            # Polyak update
-            q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-            q_target = nnx.merge(ts.q_target_graphdef, ts.q_target_state)
-
-            online_params = nnx.state(q_optimizer.model, nnx.Param)
             target_params = nnx.state(q_target, nnx.Param)
             updated_target_params = jax.tree.map(
                 lambda online, target: self.polyak * target + (1 - self.polyak) * online,
@@ -219,44 +224,37 @@ class IQN(
                 target_params,
             )
             nnx.update(q_target, updated_target_params)
-            _, q_target_state = nnx.split(q_target)
-            ts = ts.replace(q_target_state=q_target_state)
         else:
-            # Hard update at specified frequency
             update_target_params = ts.global_step % self.target_update_freq <= old_global_step % self.target_update_freq
 
-            def update_target() -> Any:
-                q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-                q_target = nnx.merge(ts.q_target_graphdef, ts.q_target_state)
-                online_params = nnx.state(q_optimizer.model, nnx.Param)
-                nnx.update(q_target, online_params)
-                _, new_target_state = nnx.split(q_target)
-                return new_target_state
+            def update_target(q_tgt):
+                nnx.update(q_tgt, online_params)
+                return q_tgt
 
-            q_target_state = jax.lax.cond(
-                update_target_params,
-                update_target,
-                lambda: ts.q_target_state,
-            )
-            ts = ts.replace(q_target_state=q_target_state)
+            def no_update_target(q_tgt):
+                return q_tgt
 
-        return ts
+            q_target = nnx.cond(update_target_params, update_target, no_update_target, q_target)
 
-    def collect_transitions(self, ts: Any, epsilon: float, uniform: bool = False) -> tuple[Any, Minibatch]:
+        # Split once at bottom
+        _, q_state = nnx.split(q_optimizer)
+        _, q_target_state = nnx.split(q_target)
+        return ts.replace(q_state=q_state, q_target_state=q_target_state)
+
+    def collect_transitions(
+        self, ts: Any, epsilon: float, q_network: nnx.Module, uniform: bool = False
+    ) -> tuple[Any, Minibatch]:
         """Collect transitions for the replay buffer.
 
         Args:
             ts: Training state
             epsilon: Exploration epsilon for epsilon-greedy
+            q_network: Live Q-network module for action selection
             uniform: Whether to sample actions uniformly (for initial buffer fill)
 
         Returns:
             Tuple of (updated_ts, minibatch)
         """
-        # Reconstruct Q-network
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-        q_network = q_optimizer.model
-
         # Sample actions
         rng, rng_action = jax.random.split(ts.rng)
         ts = ts.replace(rng=rng)
@@ -299,30 +297,21 @@ class IQN(
         )
         return ts, minibatch
 
-    def update(self, ts: Any, mb: Minibatch) -> Any:
-        """Perform one update step on the Q-network.
+    def update(self, mb: Minibatch, q_optimizer: nnx.Optimizer, q_target: nnx.Module, rng: chex.PRNGKey) -> None:
+        """Perform one update step on the Q-network. Mutates q_optimizer in-place.
+
+        Rewards must be pre-normalized by the caller if normalize_rewards is enabled.
 
         Args:
-            ts: Training state
             mb: Minibatch of transitions
-
-        Returns:
-            Updated training state
+            q_optimizer: Live Q-network optimizer
+            q_target: Live target network
+            rng: RNG key for tau sampling
         """
-        # Reconstruct networks
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
         q_network = q_optimizer.model
-        q_target = nnx.merge(ts.q_target_graphdef, ts.q_target_state)
-
-        # Normalize rewards
-        if self.normalize_rewards:
-            rewards = self.normalize_rew(ts.rew_rms_state, mb.reward)
-        else:
-            rewards = mb.reward
 
         # Split off multiple keys for tau and tau_prime
-        rng, rng_action, rng_tau, rng_tau_prime = jax.random.split(ts.rng, 4)
-        ts = ts.replace(rng=rng)
+        rng_action, rng_tau, rng_tau_prime = jax.random.split(rng, 3)
         rng_tau = jax.random.split(rng_tau, self.num_tau_samples)
         rng_tau_prime = jax.random.split(rng_tau_prime, self.num_tau_prime_samples)
 
@@ -339,7 +328,7 @@ class IQN(
         zs = jax.vmap(compute_target_z, in_axes=0, out_axes=1)(rng_tau_prime)
         best_z = jnp.take_along_axis(zs, best_action[:, None, None], axis=2).squeeze(2)
 
-        targets = rewards[:, None] + self.gamma * (1 - mb.done[:, None]) * best_z
+        targets = mb.reward[:, None] + self.gamma * (1 - mb.done[:, None]) * best_z
         assert targets.shape == (self.batch_size, self.num_tau_prime_samples)
 
         # Vmap over batch and sampled taus for quantile huber loss
@@ -374,7 +363,3 @@ class IQN(
 
         loss, grads = nnx.value_and_grad(loss_fn)(q_network)
         q_optimizer.update(grads)
-
-        # Split and update state
-        _, q_state = nnx.split(q_optimizer)
-        return ts.replace(q_state=q_state)

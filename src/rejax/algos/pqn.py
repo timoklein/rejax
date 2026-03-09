@@ -160,47 +160,52 @@ class PQN(
         Returns:
             Updated training state
         """
-        epsilon = self.epsilon_schedule(ts.global_step)
-        ts, trajectories = self.collect_trajectories(ts, epsilon)
-
-        # Reconstruct Q-network to compute last Q-value
+        # Merge once at top
         q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
         q_network = q_optimizer.model
+
+        epsilon = self.epsilon_schedule(ts.global_step)
+        ts, trajectories = self.collect_trajectories(ts, epsilon, q_network)
 
         last_q = q_network(ts.last_obs)
         max_last_q = last_q.max(axis=1)
         max_last_q = jnp.where(ts.last_done, 0, max_last_q)
         targets = self.calculate_targets(trajectories, max_last_q)
 
-        def update_epoch(ts: Any, unused: None) -> tuple:
+        def update_epoch(_, state):
+            ts, q_opt = state
             rng, minibatch_rng = jax.random.split(ts.rng)
             ts = ts.replace(rng=rng)
 
             batch = TargetMinibatch(trajectories, targets)
             minibatches = self.shuffle_and_split(batch, minibatch_rng)
-            ts, _ = jax.lax.scan(
-                lambda ts, mbs: (self.update(ts, mbs), None),
-                ts,
-                minibatches,
-            )
-            return ts, None
 
-        ts, _ = jax.lax.scan(update_epoch, ts, None, self.num_epochs)
-        return ts
+            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+            def update_step(carry, mb):
+                ts, q_opt = carry
+                self.update(ts, mb, q_opt)
+                return (ts, q_opt)
 
-    def collect_trajectories(self, ts: Any, epsilon: float) -> tuple[Any, Trajectory]:
+            ts, q_opt = update_step((ts, q_opt), minibatches)
+            return (ts, q_opt)
+
+        ts, q_optimizer = nnx.fori_loop(0, self.num_epochs, update_epoch, (ts, q_optimizer))
+
+        # Split once at bottom
+        _, q_state = nnx.split(q_optimizer)
+        return ts.replace(q_state=q_state)
+
+    def collect_trajectories(self, ts: Any, epsilon: float, q_network: nnx.Module) -> tuple[Any, Trajectory]:
         """Collect trajectories by rolling out the current policy.
 
         Args:
             ts: Training state
             epsilon: Exploration epsilon for epsilon-greedy
+            q_network: Live Q-network module for action selection
 
         Returns:
             Tuple of (updated_ts, trajectories)
         """
-        # Reconstruct Q-network
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-        q_network = q_optimizer.model
 
         def env_step(ts: Any, unused: None) -> tuple:
             rng, new_rng = jax.random.split(ts.rng)
@@ -267,20 +272,17 @@ class PQN(
         targets = jnp.concatenate((targets, lambda_returns[None]))
         return targets
 
-    def update(self, ts: Any, minibatch: TargetMinibatch) -> Any:
+    def update(self, ts: Any, minibatch: TargetMinibatch, q_optimizer: nnx.Optimizer) -> None:
         """Perform one update step on the Q-network.
+
+        Mutates q_optimizer in-place via NNX lifted transforms.
 
         Args:
             ts: Training state
             minibatch: Minibatch of data
-
-        Returns:
-            Updated training state
+            q_optimizer: Live Q-network optimizer
         """
-        # Reconstruct Q-optimizer
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
         q_network = q_optimizer.model
-
         tr, ta = minibatch.trajectories, minibatch.targets
 
         def loss_fn(model: nnx.Module) -> jax.Array:
@@ -289,7 +291,3 @@ class PQN(
 
         loss, grads = nnx.value_and_grad(loss_fn)(q_network)
         q_optimizer.update(grads)
-
-        # Split and update state
-        _, q_state = nnx.split(q_optimizer)
-        return ts.replace(q_state=q_state)

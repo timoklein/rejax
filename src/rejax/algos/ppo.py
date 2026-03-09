@@ -186,45 +186,54 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         Returns:
             Updated training state
         """
-        ts, trajectories = self.collect_trajectories(ts)
-
-        # Reconstruct critic to compute last value
+        # Merge once at top
+        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
         critic_optimizer = nnx.merge(ts.critic_graphdef, ts.critic_state)
+        actor = actor_optimizer.model
         critic = critic_optimizer.model
+
+        ts, trajectories = self.collect_trajectories(ts, actor, critic)
 
         last_val = critic(ts.last_obs)
         last_val = jnp.where(ts.last_done, 0, last_val)
         advantages, targets = self.calculate_gae(trajectories, last_val)
 
-        def update_epoch(ts: Any, unused: None) -> tuple:
+        def update_epoch(_, state):
+            ts, actor_opt, critic_opt = state
             rng, minibatch_rng = jax.random.split(ts.rng)
             ts = ts.replace(rng=rng)
             batch = AdvantageMinibatch(trajectories, advantages, targets)
             minibatches = self.shuffle_and_split(batch, minibatch_rng)
-            ts, _ = jax.lax.scan(
-                lambda ts, mbs: (self.update(ts, mbs), None),
-                ts,
-                minibatches,
-            )
-            return ts, None
 
-        ts, _ = jax.lax.scan(update_epoch, ts, None, self.num_epochs)
-        return ts
+            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+            def update_step(carry, mb):
+                ts, actor_opt, critic_opt = carry
+                self.update(mb, actor_opt, critic_opt)
+                return (ts, actor_opt, critic_opt)
 
-    def collect_trajectories(self, ts: Any) -> tuple[Any, Trajectory]:
+            ts, actor_opt, critic_opt = update_step((ts, actor_opt, critic_opt), minibatches)
+            return (ts, actor_opt, critic_opt)
+
+        ts, actor_optimizer, critic_optimizer = nnx.fori_loop(
+            0, self.num_epochs, update_epoch, (ts, actor_optimizer, critic_optimizer)
+        )
+
+        # Split once at bottom
+        _, actor_state = nnx.split(actor_optimizer)
+        _, critic_state = nnx.split(critic_optimizer)
+        return ts.replace(actor_state=actor_state, critic_state=critic_state)
+
+    def collect_trajectories(self, ts: Any, actor: nnx.Module, critic: nnx.Module) -> tuple[Any, Trajectory]:
         """Collect trajectories by rolling out the current policy.
 
         Args:
             ts: Training state
+            actor: Live actor network module
+            critic: Live critic network module
 
         Returns:
             Tuple of (updated_ts, trajectories)
         """
-        # Reconstruct networks
-        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
-        critic_optimizer = nnx.merge(ts.critic_graphdef, ts.critic_state)
-        actor = actor_optimizer.model
-        critic = critic_optimizer.model
 
         def env_step(ts: Any, unused: None) -> tuple:
             # Get keys for sampling action and stepping environment
@@ -298,25 +307,14 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         )
         return advantages, advantages + trajectories.value
 
-    def update_actor(self, ts: Any, batch: AdvantageMinibatch) -> Any:
-        """Update actor network using PPO clipped objective.
-
-        Args:
-            ts: Training state
-            batch: Minibatch of data with advantages
-
-        Returns:
-            Updated training state
-        """
-        # Reconstruct actor optimizer
-        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
+    def update_actor(self, batch: AdvantageMinibatch, actor_optimizer: nnx.Optimizer) -> None:
+        """Update actor network using PPO clipped objective. Mutates actor_optimizer in-place."""
         actor = actor_optimizer.model
 
         def actor_loss_fn(model: nnx.Module) -> jax.Array:
             log_prob, entropy = model.log_prob_entropy(batch.trajectories.obs, batch.trajectories.action)
             entropy = entropy.mean()
 
-            # Calculate actor loss
             ratio = jnp.exp(log_prob - batch.trajectories.log_prob)
             advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
             clipped_ratio = jnp.clip(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
@@ -328,22 +326,8 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
         actor_optimizer.update(grads)
 
-        # Split and update state
-        _, actor_state = nnx.split(actor_optimizer)
-        return ts.replace(actor_state=actor_state)
-
-    def update_critic(self, ts: Any, batch: AdvantageMinibatch) -> Any:
-        """Update critic network using clipped value loss.
-
-        Args:
-            ts: Training state
-            batch: Minibatch of data with targets
-
-        Returns:
-            Updated training state
-        """
-        # Reconstruct critic optimizer
-        critic_optimizer = nnx.merge(ts.critic_graphdef, ts.critic_state)
+    def update_critic(self, batch: AdvantageMinibatch, critic_optimizer: nnx.Optimizer) -> None:
+        """Update critic network using clipped value loss. Mutates critic_optimizer in-place."""
         critic = critic_optimizer.model
 
         def critic_loss_fn(model: nnx.Module) -> jax.Array:
@@ -359,20 +343,7 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
         critic_optimizer.update(grads)
 
-        # Split and update state
-        _, critic_state = nnx.split(critic_optimizer)
-        return ts.replace(critic_state=critic_state)
-
-    def update(self, ts: Any, batch: AdvantageMinibatch) -> Any:
-        """Perform one update step on actor and critic.
-
-        Args:
-            ts: Training state
-            batch: Minibatch of data
-
-        Returns:
-            Updated training state
-        """
-        ts = self.update_actor(ts, batch)
-        ts = self.update_critic(ts, batch)
-        return ts
+    def update(self, batch: AdvantageMinibatch, actor_optimizer: nnx.Optimizer, critic_optimizer: nnx.Optimizer) -> None:
+        """Perform one update step on actor and critic. Mutates optimizers in-place."""
+        self.update_actor(batch, actor_optimizer)
+        self.update_critic(batch, critic_optimizer)
