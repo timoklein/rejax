@@ -1,0 +1,19 @@
+env: brax/reacher
+env_params:
+  episode_length: 50
+agent_kwargs:
+  activation: tanh
+num_envs: 128
+num_steps: 128
+num_epochs: 8
+num_minibatches: 64
+learning_rate: 0.00027520696850790545
+max_grad_norm: 0.1
+total_timesteps: 1048576
+eval_freq: 32768
+gamma: 0.95
+gae_lambda: 0.95
+clip_eps: 0.2
+ent_coef: 0.01
+vf_coef: 0.5
+normalize_observations: true

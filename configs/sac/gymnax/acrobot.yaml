@@ -1,0 +1,15 @@
+env: Acrobot-v1
+agent_kwargs:
+  activation: tanh
+num_envs: 5
+buffer_size: 10000
+fill_buffer: 1000
+batch_size: 256
+learning_rate: 0.001
+num_epochs: 2
+total_timesteps: 50000
+eval_freq: 500
+gamma: 0.99
+polyak: 0.95
+target_entropy_ratio: 0.1
+normalize_observations: false

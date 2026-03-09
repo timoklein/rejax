@@ -1,0 +1,15 @@
+env: Pendulum-v1
+agent_kwargs:
+  activation: swish
+num_envs: 1
+buffer_size: 10000
+fill_buffer: 256
+batch_size: 256
+learning_rate: 0.01
+num_epochs: 1
+total_timesteps: 10000
+eval_freq: 100
+gamma: 0.99
+polyak: 0.98
+target_entropy_ratio: null
+normalize_observations: true

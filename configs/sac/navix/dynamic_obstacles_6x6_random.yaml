@@ -1,0 +1,15 @@
+env: navix/Navix-Dynamic-Obstacles-6x6-Random-v0
+agent_kwargs:
+  activation: tanh
+num_envs: 128
+buffer_size: 131072
+fill_buffer: 8192
+batch_size: 512
+learning_rate: 0.0003
+num_epochs: 128
+total_timesteps: 1048576
+eval_freq: 131072
+gamma: 0.8
+polyak: 0.95
+target_entropy_ratio: 0.5
+normalize_observations: false

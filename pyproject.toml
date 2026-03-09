@@ -12,6 +12,7 @@ dependencies = [
     "distrax>=0.1.5",
     "gymnax @ git+https://github.com/RobertTLange/gymnax@main",
     "jax>=0.4.34",
+    "tyro>=0.9.35",
 ]
 requires-python = ">=3.10"
 readme = "README.md"

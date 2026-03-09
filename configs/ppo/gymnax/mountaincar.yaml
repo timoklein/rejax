@@ -1,0 +1,16 @@
+env: MountainCar-v0
+agent_kwargs:
+  activation: tanh
+num_envs: 10
+num_steps: 20
+num_epochs: 5
+num_minibatches: 5
+learning_rate: 0.00025
+max_grad_norm: 0.5
+total_timesteps: 100000
+eval_freq: 1000
+gamma: 0.99
+gae_lambda: 0.98
+clip_eps: 0.2
+ent_coef: 0.0
+vf_coef: 0.5

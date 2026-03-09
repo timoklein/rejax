@@ -1,0 +1,17 @@
+env: navix/Navix-SimpleCrossingS9N1-v0
+agent_kwargs:
+  activation: swish
+num_envs: 64
+num_steps: 128
+num_epochs: 4
+num_minibatches: 4
+learning_rate: 0.0003
+max_grad_norm: 0.5
+total_timesteps: 1048576
+eval_freq: 262144
+gamma: 0.99
+gae_lambda: 0.9
+clip_eps: 0.2
+ent_coef: 0.01
+vf_coef: 0.5
+normalize_observations: true

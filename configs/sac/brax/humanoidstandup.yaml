@@ -1,0 +1,15 @@
+env: brax/humanoidstandup
+agent_kwargs:
+  activation: tanh
+num_envs: 128
+buffer_size: 1048576
+fill_buffer: 8192
+batch_size: 256
+learning_rate: 0.00020366442026830908
+num_epochs: 128
+total_timesteps: 5242880
+eval_freq: 32768
+gamma: 0.99
+polyak: 0.99
+target_entropy_ratio: 0
+normalize_observations: true

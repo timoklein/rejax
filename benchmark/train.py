@@ -1,14 +1,16 @@
+import argparse
+import dataclasses
 import json
-import os
 import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
+import tyro
 from flax import serialization
 
-from rejax.algos import get_algo
+from rejax import ALGO_CONFIG_MAP, get_algo
 from rejax.evaluate import make_evaluate as make_evaluate_vanilla
 
 
@@ -23,6 +25,8 @@ class Logger:
         self._log_step = []
         self.timer = None
         self.use_wandb = use_wandb
+
+        import os
 
         if not os.path.exists(folder):
             os.makedirs(folder)
@@ -77,6 +81,8 @@ class Logger:
         self.last_time = time.process_time()
 
     def write_log(self):
+        import os
+
         file = os.path.join(self.folder, f"{self.name}.json")
         with open(file, "w+") as f:
             data = {
@@ -86,6 +92,8 @@ class Logger:
             json.dump(data, f)
 
     def write_checkpoint(self, ckpt):
+        import os
+
         file = os.path.join(self.folder, f"{self.name}.ckpt")
         with open(file, "wb+") as f:
             f.write(serialization.to_bytes(ckpt))
@@ -129,15 +137,17 @@ def make_evaluate(logger, env, env_params, num_seeds=20):
 
 
 def main(args, config):
+    config_dict = dataclasses.asdict(config)
+
     # Initialize logging
-    escaped_env = config["env"].replace("/", "_")
+    escaped_env = config_dict["env"].replace("/", "_")
     log_name = f"{escaped_env}_{args.algorithm}_{args.num_seeds}_{args.global_seed}"
     metadata = {
-        "environment": config["env"],
+        "environment": config_dict["env"],
         "algorithm": args.algorithm,
         "num_seeds": args.num_seeds,
         "global_seed": args.global_seed,
-        "config": config,
+        "config": config_dict,
     }
     logger = Logger(args.log_dir, log_name, metadata, args.use_wandb)
     logger.write_log()
@@ -150,14 +160,14 @@ def main(args, config):
         )
 
     # Prepare train function and config
-    algo, config_cls = get_algo(args.algorithm)
-    train_config = config_cls.create(**config)
+    algo_cls = get_algo(args.algorithm)
+    train_config = algo_cls.create(**config_dict)
     evaluate = make_evaluate(logger, train_config.env, train_config.env_params)
     train_config = train_config.replace(eval_callback=evaluate)
 
     key = jax.random.PRNGKey(args.global_seed)
     keys = jax.random.split(key, args.num_seeds)
-    vmap_train = jax.jit(jax.vmap(algo.train, in_axes=(None, 0)))
+    vmap_train = jax.jit(jax.vmap(algo_cls.train, in_axes=(None, 0)))
 
     # Time compilation
     start = time.process_time()
@@ -188,68 +198,25 @@ def main(args, config):
 
 
 if __name__ == "__main__":
-    import argparse
+    # First pass: benchmark-specific args and algorithm selection
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("algorithm", type=str, help="Algorithm name (ppo, sac, td3, dqn, iqn, pqn)")
+    pre_parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
+    pre_parser.add_argument("--num-seeds", type=int, default=1, help="Number of seeds to use")
+    pre_parser.add_argument("--save-all-checkpoints", action="store_true", help="Save checkpoints of all seeds")
+    pre_parser.add_argument("--global-seed", type=int, default=0, help="Random seed for reproducibility")
+    pre_parser.add_argument("--log-dir", type=str, default="", help="Directory to store logs")
+    pre_parser.add_argument("--use-wandb", action="store_true", help="Use wandb for logging")
+    pre_parser.add_argument("--wandb-project", type=str, default="purerl", help="Wandb project name")
+    pre_parser.add_argument("--wandb-entity", type=str, default="purerl", help="Wandb entity name")
+    pre_args, remaining = pre_parser.parse_known_args()
 
-    from yaml import CLoader as Loader
-    from yaml import load
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/cartpole.yaml",
-        help="Path to configuration file.",
-    )
-    parser.add_argument(
-        "--algorithm",
-        type=str,
-        required=True,
-    )
-    parser.add_argument(
-        "--num-seeds",
-        type=int,
-        default=1,
-        help="Number of seeds to use.",
-    )
-    parser.add_argument(
-        "--save-all-checkpoints",
-        action="store_true",
-        help="Save checkpoints of all seeds.",
-    )
-    parser.add_argument(
-        "--global-seed",
-        type=int,
-        default=0,
-        help="Random seed for reproducibility.",
-    )
-    parser.add_argument(
-        "--log-dir",
-        type=str,
-        default="",
-        help="Directory to store logs.",
-    )
-    parser.add_argument(
-        "--use-wandb",
-        action="store_true",
-        help="Use wandb for logging.",
-    )
-    parser.add_argument(
-        "--wandb-project",
-        type=str,
-        default="purerl",
-        help="Wandb project name.",
-    )
-    parser.add_argument(
-        "--wandb-entity",
-        type=str,
-        default="purerl",
-        help="Wandb entity name.",
-    )
-    args = parser.parse_args()
-    with open(args.config, "r") as f:
-        config = load(f, Loader=Loader)
-
-    if args.use_wandb:
+    if pre_args.use_wandb:
         import wandb
 
-    main(args, config[args.algorithm])
+    # Load YAML defaults and apply CLI overrides via tyro
+    config_cls = ALGO_CONFIG_MAP[pre_args.algorithm]
+    default = config_cls.from_yaml(pre_args.config) if pre_args.config else config_cls()
+    config = tyro.cli(config_cls, default=default, args=remaining)
+
+    main(pre_args, config)

@@ -1,0 +1,20 @@
+env: navix/Navix-SimpleCrossingS9N1-v0
+agent_kwargs:
+  activation: tanh
+num_envs: 128
+num_epochs: 128
+buffer_size: 131072
+fill_buffer: 8192
+batch_size: 128
+learning_rate: 0.0003
+kappa: 2.0
+num_tau_samples: 32
+num_tau_prime_samples: 64
+total_timesteps: 1048576
+eval_freq: 131072
+gamma: 0.9
+eps_start: 1.0
+eps_end: 0.05
+exploration_fraction: 0.1
+target_update_freq: 1024
+normalize_observations: true

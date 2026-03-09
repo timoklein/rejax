@@ -1,0 +1,21 @@
+env: brax/humanoidstandup
+actor_kwargs:
+  activation: tanh
+critic_kwargs:
+  activation: tanh
+num_envs: 128
+buffer_size: 1048576
+fill_buffer: 8192
+batch_size: 256
+learning_rate: 0.0001538065811598203
+num_epochs: 128
+total_timesteps: 5242880
+eval_freq: 262144
+gamma: 0.99
+polyak: 0.95
+max_grad_norm: 0.2
+exploration_noise: 0.8
+target_noise: 1.0
+target_noise_clip: 0.9
+policy_delay: 10
+normalize_observations: true

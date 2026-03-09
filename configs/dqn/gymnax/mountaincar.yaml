@@ -1,0 +1,19 @@
+env: MountainCar-v0
+agent: DuelingQNetwork
+agent_kwargs:
+  activation: tanh
+num_envs: 5
+buffer_size: 10000
+fill_buffer: 1000
+batch_size: 100
+max_grad_norm: 10
+learning_rate: 0.005
+num_epochs: 5
+total_timesteps: 100000
+eval_freq: 1000
+target_update_freq: 200
+eps_start: 1
+eps_end: 0.05
+exploration_fraction: 0.5
+gamma: 1.0
+ddqn: true

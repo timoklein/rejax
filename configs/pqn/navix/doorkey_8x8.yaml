@@ -1,0 +1,15 @@
+env: navix/Navix-DoorKey-8x8-v0
+total_timesteps: 1048576
+eval_freq: 262144
+eps_start: 1
+num_envs: 512
+num_steps: 512
+num_epochs: 4
+num_minibatches: 16
+learning_rate: 0.0005136447927764416
+max_grad_norm: 5
+eps_end: 0.1
+exploration_fraction: 0.2
+gamma: 0.99
+td_lambda: 0.4
+normalize_observations: true
