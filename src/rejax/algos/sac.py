@@ -1,4 +1,10 @@
-"""Soft Actor-Critic (SAC) — standalone training function."""
+"""Soft Actor-Critic (SAC) — standalone training function.
+
+Dimension key:
+    B: batch (num_envs during collection, batch_size during updates)
+    A: action dimension (continuous action_dim)
+    C: num critics (2)
+"""
 
 from typing import Any, NamedTuple
 
@@ -167,19 +173,19 @@ def train_sac(
         if config.normalize_observations:
             last_obs = normalize_obs(carry.obs_rms, last_obs)
 
-        actions = actor.act(last_obs, rngs())
+        action_BA = actor.act(last_obs, rngs())
 
         rng_steps = jax.random.split(rngs(), num_envs)
-        next_obs, new_env_state, rewards, dones, _ = vmap_step(rng_steps, carry.env_state, actions, env_params)
+        next_obs, new_env_state, reward_B, done_B, _ = vmap_step(rng_steps, carry.env_state, action_BA, env_params)
 
         obs_rms = carry.obs_rms
         rew_rms = carry.rew_rms
         if config.normalize_observations:
             obs_rms = update_rms(obs_rms, next_obs)
         if config.normalize_rewards:
-            rew_rms = update_rew_rms(rew_rms, rewards, dones, config.gamma)
+            rew_rms = update_rew_rms(rew_rms, reward_B, done_B, config.gamma)
 
-        mb = Minibatch(obs=carry.last_obs, action=actions, reward=rewards, next_obs=next_obs, done=dones)
+        mb = Minibatch(obs=carry.last_obs, action=action_BA, reward=reward_B, next_obs=next_obs, done=done_B)
         carry = carry._replace(
             last_obs=next_obs,
             env_state=new_env_state,
@@ -196,33 +202,33 @@ def train_sac(
         action_rng = rngs()
 
         def actor_loss_fn(actor_model):
-            actions, logprobs = actor_model.action_log_prob(mb.obs, action_rng)
-            qs = jnp.stack([critic(mb.obs, actions) for critic in critics])
-            q_value = jnp.min(qs, axis=0)
-            loss = (alpha * logprobs - q_value).mean()
-            return loss, logprobs
+            action_BA, log_prob_B = actor_model.action_log_prob(mb.obs, action_rng)
+            qs_CB = jnp.stack([critic(mb.obs, action_BA) for critic in critics])  # (C, B)
+            q_min_B = jnp.min(qs_CB, axis=0)
+            loss = (alpha * log_prob_B - q_min_B).mean()
+            return loss, log_prob_B
 
-        (_loss, logprobs), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(actor_optimizer.model)
+        (_loss, log_prob_B), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(actor_optimizer.model)
         actor_optimizer.update(grads)
-        return logprobs
+        return log_prob_B
 
     # --- Update critics ---
     def update_critics(carry, mb, actor, critic_opts, critic_targets, rngs):
         alpha = jnp.exp(carry.log_alpha)
 
-        next_actions, next_logprobs = actor.action_log_prob(mb.next_obs, rngs())
+        next_action_BA, next_log_prob_B = actor.action_log_prob(mb.next_obs, rngs())
 
-        qs_target = jnp.stack([critic(mb.next_obs, next_actions) for critic in critic_targets])
-        q_target = jnp.min(qs_target, axis=0)
-        q_target = q_target - alpha * next_logprobs
-        targets = mb.reward + (1 - mb.done) * config.gamma * q_target
+        qs_target_CB = jnp.stack([critic(mb.next_obs, next_action_BA) for critic in critic_targets])  # (C, B)
+        q_target_B = jnp.min(qs_target_CB, axis=0)
+        q_target_B = q_target_B - alpha * next_log_prob_B
+        target_B = mb.reward + (1 - mb.done) * config.gamma * q_target_B
 
         for critic_opt in critic_opts:
             critic = critic_opt.model
 
             def critic_loss_fn(critic_model):
-                q = critic_model(mb.obs, mb.action)
-                return optax.l2_loss(q, targets).mean()
+                q_B = critic_model(mb.obs, mb.action)
+                return optax.l2_loss(q_B, target_B).mean()
 
             _loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
             critic_opt.update(grads)

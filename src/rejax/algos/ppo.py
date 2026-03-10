@@ -1,4 +1,10 @@
-"""Proximal Policy Optimization (PPO) — standalone training function."""
+"""Proximal Policy Optimization (PPO) — standalone training function.
+
+Dimension key:
+    B: batch (num_envs during collection, minibatch_size during updates)
+    D: observation dimension (flattened obs_space.shape)
+    T: trajectory length (num_steps)
+"""
 
 from typing import Any, NamedTuple
 
@@ -155,27 +161,27 @@ def train_ppo(
             rng_steps, rng_action = jax.random.split(step_key, 2)
             rng_steps = jax.random.split(rng_steps, num_envs)
 
-            # Sample action
-            unclipped_action, log_prob = actor.action_log_prob(carry.last_obs, rng_action)
-            value = critic(carry.last_obs)
+            # Sample action — (B,) discrete or (B, A) continuous
+            unclipped_action, log_prob_B = actor.action_log_prob(carry.last_obs, rng_action)
+            value_B = critic(carry.last_obs)
 
             action = unclipped_action if discrete else jnp.clip(unclipped_action, action_low, action_high)
 
             # Step environment
-            next_obs, new_env_state, reward, done, _ = vmap_step(rng_steps, carry.env_state, action, env_params)
+            next_obs_BD, new_env_state, reward_B, done_B, _ = vmap_step(rng_steps, carry.env_state, action, env_params)
 
             obs_rms = carry.obs_rms
             rew_rms = carry.rew_rms
             if config.normalize_observations:
-                obs_rms, next_obs = update_and_normalize_obs(obs_rms, next_obs)
+                obs_rms, next_obs_BD = update_and_normalize_obs(obs_rms, next_obs_BD)
             if config.normalize_rewards:
-                rew_rms, reward = update_and_normalize_rew(rew_rms, reward, done, config.gamma)
+                rew_rms, reward_B = update_and_normalize_rew(rew_rms, reward_B, done_B, config.gamma)
 
-            transition = Trajectory(carry.last_obs, unclipped_action, log_prob, reward, value, done)
+            transition = Trajectory(carry.last_obs, unclipped_action, log_prob_B, reward_B, value_B, done_B)
             carry = carry._replace(
                 env_state=new_env_state,
-                last_obs=next_obs,
-                last_done=done,
+                last_obs=next_obs_BD,
+                last_done=done_B,
                 global_step=carry.global_step + num_envs,
                 obs_rms=obs_rms,
                 rew_rms=rew_rms,
@@ -186,34 +192,34 @@ def train_ppo(
         return carry, trajectories
 
     # --- Calculate GAE ---
-    def calculate_gae(trajectories, last_val):
+    def calculate_gae(trajectories, last_val_B):
         def get_advantages(advantage_and_next_value, transition):
-            advantage, next_value = advantage_and_next_value
-            delta = transition.reward.squeeze() + config.gamma * next_value * (1 - transition.done) - transition.value
-            advantage = delta + config.gamma * config.gae_lambda * (1 - transition.done) * advantage
-            return (advantage, transition.value), advantage
+            advantage_B, next_value_B = advantage_and_next_value
+            delta_B = transition.reward.squeeze() + config.gamma * next_value_B * (1 - transition.done) - transition.value
+            advantage_B = delta_B + config.gamma * config.gae_lambda * (1 - transition.done) * advantage_B
+            return (advantage_B, transition.value), advantage_B
 
-        _, advantages = jax.lax.scan(
+        _, advantages_TB = jax.lax.scan(
             get_advantages,
-            (jnp.zeros_like(last_val), last_val),
+            (jnp.zeros_like(last_val_B), last_val_B),
             trajectories,
             reverse=True,
         )
-        return advantages, advantages + trajectories.value
+        return advantages_TB, advantages_TB + trajectories.value
 
     # --- Update actor ---
     def update_actor(batch, actor_optimizer):
         actor = actor_optimizer.model
 
         def actor_loss_fn(model):
-            log_prob, entropy = model.log_prob_entropy(batch.trajectories.obs, batch.trajectories.action)
-            entropy = entropy.mean()
-            ratio = jnp.exp(log_prob - batch.trajectories.log_prob)
-            advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
-            clipped_ratio = jnp.clip(ratio, 1 - config.clip_eps, 1 + config.clip_eps)
-            pi_loss1 = ratio * advantages
-            pi_loss2 = clipped_ratio * advantages
-            pi_loss = -jnp.minimum(pi_loss1, pi_loss2).mean()
+            log_prob_B, entropy_B = model.log_prob_entropy(batch.trajectories.obs, batch.trajectories.action)
+            entropy = entropy_B.mean()
+            ratio_B = jnp.exp(log_prob_B - batch.trajectories.log_prob)
+            adv_B = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
+            clipped_ratio_B = jnp.clip(ratio_B, 1 - config.clip_eps, 1 + config.clip_eps)
+            pi_loss1_B = ratio_B * adv_B
+            pi_loss2_B = clipped_ratio_B * adv_B
+            pi_loss = -jnp.minimum(pi_loss1_B, pi_loss2_B).mean()
             return pi_loss - config.ent_coef * entropy
 
         _loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
@@ -224,13 +230,13 @@ def train_ppo(
         critic = critic_optimizer.model
 
         def critic_loss_fn(model):
-            value = model(batch.trajectories.obs)
-            value_pred_clipped = batch.trajectories.value + (value - batch.trajectories.value).clip(
+            value_B = model(batch.trajectories.obs)
+            value_clipped_B = batch.trajectories.value + (value_B - batch.trajectories.value).clip(
                 -config.clip_eps, config.clip_eps
             )
-            value_losses = jnp.square(value - batch.targets)
-            value_losses_clipped = jnp.square(value_pred_clipped - batch.targets)
-            value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+            loss_B = jnp.square(value_B - batch.targets)
+            loss_clipped_B = jnp.square(value_clipped_B - batch.targets)
+            value_loss = 0.5 * jnp.maximum(loss_B, loss_clipped_B).mean()
             return config.vf_coef * value_loss
 
         _loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
@@ -243,9 +249,9 @@ def train_ppo(
 
         carry, trajectories = collect_trajectories(carry, actor, critic, rngs)
 
-        last_val = critic(carry.last_obs)
-        last_val = jnp.where(carry.last_done, 0, last_val)
-        advantages, targets = calculate_gae(trajectories, last_val)
+        last_val_B = critic(carry.last_obs)
+        last_val_B = jnp.where(carry.last_done, 0, last_val_B)
+        advantages, targets = calculate_gae(trajectories, last_val_B)
 
         def update_epoch(_, state):
             actor_opt, critic_opt, rngs = state

@@ -1,4 +1,10 @@
-"""Implicit Quantile Network (IQN) — standalone training function."""
+"""Implicit Quantile Network (IQN) — standalone training function.
+
+Dimension key:
+    B: batch (num_envs during collection, batch_size during updates)
+    A: action dimension (num_actions)
+    K: num quantile samples (num_tau_samples or num_tau_prime_samples)
+"""
 
 from typing import Any, NamedTuple
 
@@ -152,15 +158,15 @@ def train_iqn(
         rng_tau = jax.random.split(rng_tau, config.num_tau_samples)
         rng_tau_prime = jax.random.split(rng_tau_prime, config.num_tau_prime_samples)
 
-        best_action = q_network.best_action(mb.next_obs, rng_action)
+        best_action_B = q_network.best_action(mb.next_obs, rng_action)
 
         def compute_target_z(rng_t):
-            zs, _ = q_target(mb.next_obs, rng_t)
-            return zs
+            z_BA, _ = q_target(mb.next_obs, rng_t)
+            return z_BA
 
-        zs = jax.vmap(compute_target_z, in_axes=0, out_axes=1)(rng_tau_prime)
-        best_z = jnp.take_along_axis(zs, best_action[:, None, None], axis=2).squeeze(2)
-        targets = mb.reward[:, None] + config.gamma * (1 - mb.done[:, None]) * best_z
+        z_BKA = jax.vmap(compute_target_z, in_axes=0, out_axes=1)(rng_tau_prime)  # (B, K', A)
+        best_z_BK = jnp.take_along_axis(z_BKA, best_action_B[:, None, None], axis=2).squeeze(2)  # (B, K')
+        target_BK = mb.reward[:, None] + config.gamma * (1 - mb.done[:, None]) * best_z_BK  # (B, K')
 
         @jax.vmap
         @jax.vmap
@@ -170,13 +176,14 @@ def train_iqn(
 
         def loss_fn(model):
             def compute_z(rng_t):
-                z, tau = model(mb.obs, rng_t)
-                return z, tau
+                z_BA, tau_B = model(mb.obs, rng_t)
+                return z_BA, tau_B
 
-            z, tau = jax.vmap(compute_z, in_axes=0, out_axes=1)(rng_tau)
-            z = jnp.take_along_axis(z, mb.action[:, None, None], axis=2).squeeze(2)
-            td_err = jax.vmap(lambda x, y: x[None, :] - y[:, None])(targets, z)
-            loss = rho(td_err, tau).sum(axis=1)
+            z_BKA, tau_BK = jax.vmap(compute_z, in_axes=0, out_axes=1)(rng_tau)  # (B, K, A), (B, K)
+            z_BK = jnp.take_along_axis(z_BKA, mb.action[:, None, None], axis=2).squeeze(2)  # (B, K)
+            # (B, K', K) — target quantiles x online quantiles
+            td_BKK = jax.vmap(lambda x, y: x[None, :] - y[:, None])(target_BK, z_BK)
+            loss = rho(td_BKK, tau_BK).sum(axis=1)
             return loss.mean()
 
         _loss, grads = nnx.value_and_grad(loss_fn)(q_network)

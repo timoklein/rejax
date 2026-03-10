@@ -1,4 +1,9 @@
-"""Deep Q-Network (DQN) — standalone training function."""
+"""Deep Q-Network (DQN) — standalone training function.
+
+Dimension key:
+    B: batch (num_envs during collection, batch_size during updates)
+    A: action dimension (num_actions)
+"""
 
 from typing import Any, NamedTuple
 
@@ -169,22 +174,22 @@ def train_dqn(
     # --- Update Q-network ---
     def update_q(mb, q_optimizer, q_target):
         q_network = q_optimizer.model
-        next_q_target_values = q_target(mb.next_obs)
+        next_q_target_BA = q_target(mb.next_obs)
 
         def vanilla_targets():
-            return jnp.max(next_q_target_values, axis=1)
+            return jnp.max(next_q_target_BA, axis=1)
 
         def ddqn_targets():
-            next_q_values = q_network(mb.next_obs)
-            next_action = jnp.argmax(next_q_values, axis=1, keepdims=True)
-            return jnp.take_along_axis(next_q_target_values, next_action, axis=1).squeeze(axis=1)
+            next_q_BA = q_network(mb.next_obs)
+            next_action_B1 = jnp.argmax(next_q_BA, axis=1, keepdims=True)
+            return jnp.take_along_axis(next_q_target_BA, next_action_B1, axis=1).squeeze(axis=1)
 
-        next_q = jax.lax.cond(config.ddqn, ddqn_targets, vanilla_targets)
-        targets = mb.reward + jnp.logical_not(mb.done) * config.gamma * next_q
+        next_q_B = jax.lax.cond(config.ddqn, ddqn_targets, vanilla_targets)
+        target_B = mb.reward + jnp.logical_not(mb.done) * config.gamma * next_q_B
 
         def loss_fn(model):
-            q_values = model.take(mb.obs, mb.action)
-            return optax.l2_loss(q_values, targets).mean()
+            q_B = model.take(mb.obs, mb.action)
+            return optax.l2_loss(q_B, target_B).mean()
 
         _loss, grads = nnx.value_and_grad(loss_fn)(q_network)
         q_optimizer.update(grads)

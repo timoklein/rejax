@@ -1,4 +1,13 @@
-"""Neural network architectures using Flax NNX for Rejax RL algorithms."""
+"""Neural network architectures using Flax NNX for Rejax RL algorithms.
+
+Dimension key:
+    B: batch size
+    D: observation dimension (flattened obs_space.shape)
+    A: action dimension (num_actions for discrete, action_dim for continuous)
+    H: hidden layer size
+    K: num quantile samples (IQN only)
+    E: cosine embedding dimension (IQN only)
+"""
 
 from collections.abc import Callable, Sequence
 
@@ -50,18 +59,18 @@ class DiscretePolicy(nnx.Module):
         self.action_logits = nnx.Linear(hidden_layer_sizes[-1], action_dim, rngs=rngs)
 
     def _action_dist(self, obs: jax.Array) -> distrax.Categorical:
-        features = self.features(obs)
-        action_logits = self.action_logits(features)
-        return distrax.Categorical(logits=action_logits)
+        features_BH = self.features(obs)
+        logits_BA = self.action_logits(features_BH)
+        return distrax.Categorical(logits=logits_BA)
 
     def __call__(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
-        action = action_dist.sample(seed=rng)
-        return action, action_dist.log_prob(action), action_dist.entropy()
+        action_B = action_dist.sample(seed=rng)
+        return action_B, action_dist.log_prob(action_B), action_dist.entropy()
 
     def act(self, obs: jax.Array, rng: jax.Array) -> jax.Array:
-        action, _, _ = self(obs, rng)
-        return action
+        action_B, _, _ = self(obs, rng)
+        return action_B
 
     def log_prob_entropy(self, obs: jax.Array, action: jax.Array) -> tuple[jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
@@ -69,8 +78,8 @@ class DiscretePolicy(nnx.Module):
 
     def action_log_prob(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
-        action = action_dist.sample(seed=rng)
-        return action, action_dist.log_prob(action)
+        action_B = action_dist.sample(seed=rng)
+        return action_B, action_dist.log_prob(action_B)
 
 
 class GaussianPolicy(nnx.Module):
@@ -93,18 +102,18 @@ class GaussianPolicy(nnx.Module):
         self.action_log_std = nnx.Param(jnp.zeros(action_dim))
 
     def _action_dist(self, obs: jax.Array) -> distrax.MultivariateNormalDiag:
-        features = self.features(obs)
-        action_mean = self.action_mean(features)
-        return distrax.MultivariateNormalDiag(loc=action_mean, scale_diag=jnp.exp(self.action_log_std.value))
+        features_BH = self.features(obs)
+        mean_BA = self.action_mean(features_BH)
+        return distrax.MultivariateNormalDiag(loc=mean_BA, scale_diag=jnp.exp(self.action_log_std.value))
 
     def __call__(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
-        action = action_dist.sample(seed=rng)
-        return action, action_dist.log_prob(action), action_dist.entropy()
+        action_BA = action_dist.sample(seed=rng)
+        return action_BA, action_dist.log_prob(action_BA), action_dist.entropy()
 
     def act(self, obs: jax.Array, rng: jax.Array) -> jax.Array:
-        action, _, _ = self(obs, rng)
-        return jnp.clip(action, self.action_range[0], self.action_range[1])
+        action_BA, _, _ = self(obs, rng)
+        return jnp.clip(action_BA, self.action_range[0], self.action_range[1])
 
     def log_prob_entropy(self, obs: jax.Array, action: jax.Array) -> tuple[jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
@@ -112,8 +121,8 @@ class GaussianPolicy(nnx.Module):
 
     def action_log_prob(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
-        action = action_dist.sample(seed=rng)
-        return action, action_dist.log_prob(action)
+        action_BA = action_dist.sample(seed=rng)
+        return action_BA, action_dist.log_prob(action_BA)
 
 
 class SquashedGaussianPolicy(nnx.Module):
@@ -153,21 +162,21 @@ class SquashedGaussianPolicy(nnx.Module):
         # *before* the tanh transform. Doing it afterwards runs into numerical issues
         # because we cannot invert the tanh for +-1, which can easily be sampled.
         # (e.g. jnp.tanh(8) = 1)
-        features = self.features(obs)
-        action_mean = self.action_mean(features)
-        action_log_std = self.action_log_std(features)
-        action_log_std = jnp.clip(action_log_std, *self.log_std_range)  # TODO: tanh transform?
+        features_BH = self.features(obs)
+        mean_BA = self.action_mean(features_BH)
+        log_std_BA = self.action_log_std(features_BH)
+        log_std_BA = jnp.clip(log_std_BA, *self.log_std_range)  # TODO: tanh transform?
 
-        return distrax.MultivariateNormalDiag(loc=action_mean, scale_diag=jnp.exp(action_log_std))
+        return distrax.MultivariateNormalDiag(loc=mean_BA, scale_diag=jnp.exp(log_std_BA))
 
     def __call__(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
-        action = action_dist.sample(seed=rng)
-        action_log_prob = action_dist.log_prob(action)
-        action, log_det_j = self.bij.forward_and_log_det(action)
-        action = self.action_loc + action * self.action_scale
-        action_log_prob -= log_det_j.sum(axis=-1)
-        return action, action_log_prob
+        action_BA = action_dist.sample(seed=rng)
+        log_prob_B = action_dist.log_prob(action_BA)
+        action_BA, log_det_j = self.bij.forward_and_log_det(action_BA)
+        action_BA = self.action_loc + action_BA * self.action_scale
+        log_prob_B -= log_det_j.sum(axis=-1)
+        return action_BA, log_prob_B
 
     def action_log_prob(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, jax.Array]:
         return self(obs, rng)
@@ -179,13 +188,13 @@ class SquashedGaussianPolicy(nnx.Module):
         action_dist = self._action_dist(obs)
         action = (action - self.action_loc) / self.action_scale
         action, log_det_j = self.bij.inverse_and_log_det(action)  # type: ignore[assignment]
-        action_log_prob = action_dist.log_prob(action)
-        action_log_prob += log_det_j.sum(axis=-1)
-        return action_log_prob
+        log_prob_B = action_dist.log_prob(action)
+        log_prob_B += log_det_j.sum(axis=-1)
+        return log_prob_B
 
     def act(self, obs: jax.Array, rng: jax.Array) -> jax.Array:
-        action, _ = self(obs, rng)
-        return action
+        action_BA, _ = self(obs, rng)
+        return action_BA
 
 
 class BetaPolicy(nnx.Module):
@@ -215,25 +224,25 @@ class BetaPolicy(nnx.Module):
         return self.action_range[1] - self.action_range[0]
 
     def _action_dist(self, obs: jax.Array) -> distrax.Beta:
-        x = self.features(obs)
-        alpha = 1 + nnx.softplus(self.alpha(x))
-        beta = 1 + nnx.softplus(self.beta(x))
-        return distrax.Beta(alpha, beta)
+        features_BH = self.features(obs)
+        alpha_BA = 1 + nnx.softplus(self.alpha(features_BH))
+        beta_BA = 1 + nnx.softplus(self.beta(features_BH))
+        return distrax.Beta(alpha_BA, beta_BA)
 
     def __call__(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        action, _ = self.action_log_prob(obs, rng)
-        return action, *self.log_prob_entropy(obs, action)
+        action_BA, _ = self.action_log_prob(obs, rng)
+        return action_BA, *self.log_prob_entropy(obs, action_BA)
 
     def action_log_prob(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
-        action = action_dist.sample(seed=rng)
-        log_prob = action_dist.log_prob(action)
-        action = self.action_loc + action * self.action_scale
-        return action, log_prob.squeeze(1)
+        action_BA = action_dist.sample(seed=rng)
+        log_prob_B = action_dist.log_prob(action_BA)
+        action_BA = self.action_loc + action_BA * self.action_scale
+        return action_BA, log_prob_B.squeeze(1)
 
     def act(self, obs: jax.Array, rng: jax.Array) -> jax.Array:
-        action, _ = self.action_log_prob(obs, rng)
-        return action
+        action_BA, _ = self.action_log_prob(obs, rng)
+        return action_BA
 
     def log_prob_entropy(self, obs: jax.Array, action: jax.Array) -> tuple[jax.Array, jax.Array]:
         action_dist = self._action_dist(obs)
@@ -273,16 +282,16 @@ class DeterministicPolicy(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         for layer in self.layers:
-            x = self.activation(layer(x))
-        x = self.output_layer(x)
+            x = self.activation(layer(x))  # (B, D) -> (B, H)
+        x = self.output_layer(x)  # (B, H) -> (B, A)
         x = jnp.tanh(x)
 
-        action = self.action_loc + x * self.action_scale
-        return action
+        action_BA = self.action_loc + x * self.action_scale
+        return action_BA
 
     def act(self, obs: jax.Array, rng: jax.Array) -> jax.Array:
-        action = self(obs)
-        return action
+        action_BA = self(obs)
+        return action_BA
 
 
 # Value networks
@@ -303,7 +312,7 @@ class VNetwork(nnx.Module):
 
     def __call__(self, obs: jax.Array) -> jax.Array:
         x = self.mlp(obs)
-        return self.value_head(x).squeeze(1)
+        return self.value_head(x).squeeze(1)  # (B,)
 
 
 class QNetwork(nnx.Module):
@@ -322,9 +331,9 @@ class QNetwork(nnx.Module):
         self.q_head = nnx.Linear(hidden_layer_sizes[-1], 1, rngs=rngs)
 
     def __call__(self, obs: jax.Array, action: jax.Array) -> jax.Array:
-        x = jnp.concatenate([obs.reshape(obs.shape[0], -1), action], axis=-1)
+        x = jnp.concatenate([obs.reshape(obs.shape[0], -1), action], axis=-1)  # (B, D+A)
         x = self.mlp(x)
-        return self.q_head(x).squeeze(1)
+        return self.q_head(x).squeeze(1)  # (B,)
 
 
 class DiscreteQNetwork(nnx.Module):
@@ -344,16 +353,17 @@ class DiscreteQNetwork(nnx.Module):
 
     def __call__(self, obs: jax.Array) -> jax.Array:
         x = self.mlp(obs)
-        return self.q_head(x)
+        return self.q_head(x)  # (B, A)
 
     def take(self, obs: jax.Array, action: jax.Array) -> jax.Array:
         """Get Q-values for specific actions."""
-        q_values = self(obs)
-        return jnp.take_along_axis(q_values, action[:, None], axis=1).squeeze(1)
+        q_BA = self(obs)
+        q_B = jnp.take_along_axis(q_BA, action[:, None], axis=1).squeeze(1)
+        return q_B
 
     def act(self, obs: jax.Array, rng: jax.Array, epsilon: float = 0.05) -> jax.Array:
-        q = self(obs)
-        action_dist = distrax.EpsilonGreedy(q, epsilon=epsilon)
+        q_BA = self(obs)
+        action_dist = distrax.EpsilonGreedy(q_BA, epsilon=epsilon)
         return action_dist.sample(seed=rng)
 
 
@@ -375,19 +385,20 @@ class DuelingQNetwork(nnx.Module):
 
     def __call__(self, obs: jax.Array) -> jax.Array:
         x = self.mlp(obs)
-        value = self.value_head(x)
-        advantage = self.advantage_head(x)
-        advantage = advantage - jnp.mean(advantage, axis=-1, keepdims=True)
-        return value + advantage
+        value_B1 = self.value_head(x)  # (B, 1)
+        advantage_BA = self.advantage_head(x)  # (B, A)
+        advantage_BA = advantage_BA - jnp.mean(advantage_BA, axis=-1, keepdims=True)
+        return value_B1 + advantage_BA  # (B, A)
 
     def take(self, obs: jax.Array, action: jax.Array) -> jax.Array:
         """Get Q-values for specific actions."""
-        q_values = self(obs)
-        return jnp.take_along_axis(q_values, action[:, None], axis=1).squeeze(1)
+        q_BA = self(obs)
+        q_B = jnp.take_along_axis(q_BA, action[:, None], axis=1).squeeze(1)
+        return q_B
 
     def act(self, obs: jax.Array, rng: jax.Array, epsilon: float = 0.05) -> jax.Array:
-        q = self(obs)
-        action_dist = distrax.EpsilonGreedy(q, epsilon=epsilon)
+        q_BA = self(obs)
+        action_dist = distrax.EpsilonGreedy(q_BA, epsilon=epsilon)
         return action_dist.sample(seed=rng)
 
 
@@ -440,15 +451,15 @@ class ImplicitQuantileNetwork(nnx.Module):
             tau: Sampled quantiles with shape (batch_size,)
         """
         x = obs.reshape(obs.shape[0], -1)
-        psi = self.state_mlp(x)
+        psi_BH = self.state_mlp(x)
 
-        tau = distrax.Uniform(0, 1).sample(seed=rng, sample_shape=obs.shape[0])
-        tau = self.risk_distortion(tau)
-        phi_input = jnp.cos(jnp.pi * jnp.outer(tau, jnp.arange(self.embedding_dim)))
-        phi = nnx.relu(self.phi_dense(phi_input))
+        tau_B = distrax.Uniform(0, 1).sample(seed=rng, sample_shape=obs.shape[0])
+        tau_B = self.risk_distortion(tau_B)
+        phi_BE = jnp.cos(jnp.pi * jnp.outer(tau_B, jnp.arange(self.embedding_dim)))
+        phi_BE = nnx.relu(self.phi_dense(phi_BE))
 
-        x = nnx.swish(self.combine_dense(psi * phi))
-        return self.output_dense(x), tau
+        x = nnx.swish(self.combine_dense(psi_BH * phi_BE))
+        return self.output_dense(x), tau_B  # (B, A), (B,)
 
     def q(self, obs: jax.Array, rng: jax.Array, num_samples: int = 32) -> jax.Array:
         """Compute expected Q-values by averaging over quantile samples.
@@ -462,8 +473,8 @@ class ImplicitQuantileNetwork(nnx.Module):
             Q-values with shape (batch_size, action_dim)
         """
         rng = jax.random.split(rng, num_samples)
-        zs, _ = jax.vmap(self, in_axes=(None, 0))(obs, rng)
-        return zs.mean(axis=0)
+        z_KBA, _ = jax.vmap(self, in_axes=(None, 0))(obs, rng)  # (K, B, A)
+        return z_KBA.mean(axis=0)  # (B, A)
 
     def best_action(self, obs: jax.Array, rng: jax.Array, num_samples: int = 32) -> jax.Array:
         """Select best action based on expected Q-values.
@@ -476,12 +487,12 @@ class ImplicitQuantileNetwork(nnx.Module):
         Returns:
             Best actions with shape (batch_size,)
         """
-        q = self.q(obs, rng, num_samples)
-        best_action = jnp.argmax(q, axis=1)
-        return best_action
+        q_BA = self.q(obs, rng, num_samples)
+        best_action_B = jnp.argmax(q_BA, axis=1)
+        return best_action_B
 
     def act(self, obs: jax.Array, rng: jax.Array, epsilon: float = 0.05) -> jax.Array:
         rng_tau, rng_epsilon = jax.random.split(rng)
-        q = self.q(obs, rng_tau)
-        action_dist = distrax.EpsilonGreedy(q, epsilon=epsilon)
+        q_BA = self.q(obs, rng_tau)
+        action_dist = distrax.EpsilonGreedy(q_BA, epsilon=epsilon)
         return action_dist.sample(seed=rng_epsilon)

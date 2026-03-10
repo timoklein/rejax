@@ -1,4 +1,10 @@
-"""Twin Delayed Deep Deterministic Policy Gradient (TD3) — standalone training function."""
+"""Twin Delayed Deep Deterministic Policy Gradient (TD3) — standalone training function.
+
+Dimension key:
+    B: batch (num_envs during collection, batch_size during updates)
+    A: action dimension (continuous action_dim)
+    C: num critics (2)
+"""
 
 from typing import Any, NamedTuple
 
@@ -162,9 +168,9 @@ def train_td3(
             last_obs = carry.last_obs
             if config.normalize_observations:
                 last_obs = normalize_obs(carry.obs_rms, last_obs)
-            actions = actor(last_obs)
-            noise = config.exploration_noise * jax.random.normal(rng, actions.shape)
-            return jnp.clip(actions + noise, action_low, action_high)
+            action_BA = actor(last_obs)
+            noise_BA = config.exploration_noise * jax.random.normal(rng, action_BA.shape)
+            return jnp.clip(action_BA + noise_BA, action_low, action_high)
 
         actions = jax.lax.cond(uniform, sample_uniform, sample_policy, rng_action)
 
@@ -190,24 +196,24 @@ def train_td3(
 
     # --- Update critics ---
     def update_critics(mb, actor_target, critic_opts, critic_targets, rngs):
-        action = actor_target(mb.next_obs)
-        noise = jnp.clip(
-            config.target_noise * jax.random.normal(rngs(), action.shape),
+        next_action_BA = actor_target(mb.next_obs)
+        noise_BA = jnp.clip(
+            config.target_noise * jax.random.normal(rngs(), next_action_BA.shape),
             -config.target_noise_clip,
             config.target_noise_clip,
         )
-        action = jnp.clip(action + noise, action_low, action_high)
+        next_action_BA = jnp.clip(next_action_BA + noise_BA, action_low, action_high)
 
-        qs_target = jnp.stack([critic(mb.next_obs, action) for critic in critic_targets])
-        q_target = jnp.min(qs_target, axis=0)
-        targets = mb.reward + (1 - mb.done) * config.gamma * q_target
+        qs_target_CB = jnp.stack([critic(mb.next_obs, next_action_BA) for critic in critic_targets])  # (C, B)
+        q_target_B = jnp.min(qs_target_CB, axis=0)
+        target_B = mb.reward + (1 - mb.done) * config.gamma * q_target_B
 
         for critic_opt in critic_opts:
             critic = critic_opt.model
 
             def critic_loss_fn(critic_model):
-                q = critic_model(mb.obs, mb.action)
-                return optax.l2_loss(q, targets).mean()
+                q_B = critic_model(mb.obs, mb.action)
+                return optax.l2_loss(q_B, target_B).mean()
 
             _loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
             critic_opt.update(grads)
@@ -218,9 +224,9 @@ def train_td3(
         critics = [opt.model for opt in critic_opts]
 
         def actor_loss_fn(actor_model):
-            action = actor_model(mb.obs)
-            q = critics[0](mb.obs, action)
-            return -q.mean()
+            action_BA = actor_model(mb.obs)
+            q_B = critics[0](mb.obs, action_BA)
+            return -q_B.mean()
 
         _loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
         actor_optimizer.update(grads)

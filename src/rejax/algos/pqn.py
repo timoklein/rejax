@@ -2,6 +2,11 @@
 
 Adapted from https://github.com/mttga/purejaxql/blob/main/purejaxql/pqn_gymnax.py
 by Matteo Gallici et. al.
+
+Dimension key:
+    B: batch (num_envs during collection, minibatch_size during updates)
+    A: action dimension (num_actions)
+    T: trajectory length (num_steps)
 """
 
 from typing import Any, NamedTuple
@@ -151,27 +156,27 @@ def train_pqn(
             rng_action, rng_step = jax.random.split(step_key)
 
             # Sample action using epsilon-greedy policy
-            action = q_network.act(carry.last_obs, rng_action, epsilon=epsilon)
+            action_B = q_network.act(carry.last_obs, rng_action, epsilon=epsilon)
 
             # Step environment
             rng_steps = jax.random.split(rng_step, num_envs)
-            next_obs, new_env_state, reward, done, _ = vmap_step(rng_steps, carry.env_state, action, env_params)
+            next_obs, new_env_state, reward_B, done_B, _ = vmap_step(rng_steps, carry.env_state, action_B, env_params)
 
             # Compute Q-values for next state
-            next_q = q_network(next_obs)
+            next_q_BA = q_network(next_obs)
 
             obs_rms = carry.obs_rms
             rew_rms = carry.rew_rms
             if config.normalize_observations:
                 obs_rms, next_obs = update_and_normalize_obs(obs_rms, next_obs)
             if config.normalize_rewards:
-                rew_rms, reward = update_and_normalize_rew(rew_rms, reward, done, config.gamma)
+                rew_rms, reward_B = update_and_normalize_rew(rew_rms, reward_B, done_B, config.gamma)
 
-            transition = Trajectory(carry.last_obs, action, next_q, reward, done)
+            transition = Trajectory(carry.last_obs, action_B, next_q_BA, reward_B, done_B)
             carry = carry._replace(
                 env_state=new_env_state,
                 last_obs=next_obs,
-                last_done=done,
+                last_done=done_B,
                 global_step=carry.global_step + num_envs,
                 obs_rms=obs_rms,
                 rew_rms=rew_rms,
@@ -182,24 +187,24 @@ def train_pqn(
         return carry, trajectories
 
     # --- Calculate TD-lambda targets ---
-    def calculate_targets(trajectories, max_last_q):
+    def calculate_targets(trajectories, max_last_q_B):
         def get_target(lambda_return_and_next_q, t):
-            lambda_return, next_q = lambda_return_and_next_q
-            return_bootstrap = next_q + config.td_lambda * (lambda_return - next_q)
-            lambda_return = t.reward + (1 - t.done) * config.gamma * return_bootstrap
-            max_next_q = t.next_q.max(axis=1)
-            return (lambda_return, max_next_q), lambda_return
+            lambda_return_B, next_q_B = lambda_return_and_next_q
+            return_bootstrap_B = next_q_B + config.td_lambda * (lambda_return_B - next_q_B)
+            lambda_return_B = t.reward + (1 - t.done) * config.gamma * return_bootstrap_B
+            max_next_q_B = t.next_q.max(axis=1)
+            return (lambda_return_B, max_next_q_B), lambda_return_B
 
-        max_last_q = jnp.where(trajectories.done[-1], 0, max_last_q)
-        lambda_returns = trajectories.reward[-1] + config.gamma * max_last_q  # type: ignore[operator]
-        _, targets = jax.lax.scan(
+        max_last_q_B = jnp.where(trajectories.done[-1], 0, max_last_q_B)
+        lambda_returns_B = trajectories.reward[-1] + config.gamma * max_last_q_B  # type: ignore[operator]
+        _, targets_TB = jax.lax.scan(
             get_target,
-            (lambda_returns, max_last_q),
+            (lambda_returns_B, max_last_q_B),
             jax.tree.map(lambda x: x[:-1], trajectories),
             reverse=True,
         )
-        targets = jnp.concatenate((targets, lambda_returns[None]))
-        return targets
+        targets_TB = jnp.concatenate((targets_TB, lambda_returns_B[None]))
+        return targets_TB
 
     # --- Update Q-network ---
     def update_q(mb, q_optimizer):
@@ -207,8 +212,8 @@ def train_pqn(
         tr, ta = mb.trajectories, mb.targets
 
         def loss_fn(model):
-            q_values = model.take(tr.obs, tr.action)
-            return optax.l2_loss(q_values, ta).mean()
+            q_B = model.take(tr.obs, tr.action)
+            return optax.l2_loss(q_B, ta).mean()
 
         _loss, grads = nnx.value_and_grad(loss_fn)(q_network)
         q_optimizer.update(grads)
@@ -219,10 +224,10 @@ def train_pqn(
 
         carry, trajectories = collect_trajectories(carry, q_network, rngs)
 
-        last_q = q_network(carry.last_obs)
-        max_last_q = last_q.max(axis=1)
-        max_last_q = jnp.where(carry.last_done, 0, max_last_q)
-        targets = calculate_targets(trajectories, max_last_q)
+        last_q_BA = q_network(carry.last_obs)
+        max_last_q_B = last_q_BA.max(axis=1)
+        max_last_q_B = jnp.where(carry.last_done, 0, max_last_q_B)
+        targets = calculate_targets(trajectories, max_last_q_B)
 
         def update_epoch(_, state):
             q_opt, rngs = state
