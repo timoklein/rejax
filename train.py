@@ -1,5 +1,4 @@
 import argparse
-import dataclasses
 import timeit
 
 import jax
@@ -7,39 +6,23 @@ import jax.numpy as jnp
 import tyro
 from matplotlib import pyplot as plt
 
-from rejax import ALGO_CONFIG_MAP, get_algo
+from rejax import ALGO_CONFIG_MAP, get_train_fn
 
 
-def main(algo_str, config, seed_id, num_seeds, time_fit):
-    algo_cls = get_algo(algo_str)
-    algo = algo_cls.create(**dataclasses.asdict(config))
-    print(algo.config)
-
-    old_eval_callback = algo.eval_callback
-
-    def eval_callback(algo, ts, rng):
-        lengths, returns = old_eval_callback(algo, ts, rng)
-        jax.debug.print(
-            "Step {}, Mean episode length: {}, Mean return: {}",
-            ts.global_step,
-            lengths.mean(),
-            returns.mean(),
-        )
-        return lengths, returns
-
-    algo = algo.replace(eval_callback=eval_callback)
+def main(algo_str: str, config: object, seed_id: int, num_seeds: int, time_fit: bool) -> None:
+    train_fn = get_train_fn(algo_str)
 
     # Train it
     key = jax.random.PRNGKey(seed_id)
     keys = jax.random.split(key, num_seeds)
 
-    vmap_train = jax.jit(jax.vmap(algo_cls.train, in_axes=(None, 0)))
-    ts, (_, returns) = vmap_train(algo, keys)
+    vmap_train = jax.jit(jax.vmap(train_fn, in_axes=(None, 0)), static_argnums=(0,))
+    state, (lengths, returns) = vmap_train(config, keys)
     returns.block_until_ready()
 
     print(f"Achieved mean return of {returns.mean(axis=-1)[:, -1]}")
 
-    t = jnp.arange(returns.shape[1]) * algo.eval_freq
+    t = jnp.arange(returns.shape[1]) * config.eval_freq
     colors = plt.cm.cool(jnp.linspace(0, 1, num_seeds))
     for i in range(num_seeds):
         plt.plot(t, returns.mean(axis=-1)[i], c=colors[i])
@@ -49,7 +32,7 @@ def main(algo_str, config, seed_id, num_seeds, time_fit):
         print("Fitting 3 times, getting a mean time of... ", end="", flush=True)
 
         def time_fn():
-            return vmap_train(algo, keys)
+            return vmap_train(config, keys)
 
         time = timeit.timeit(time_fn, number=3) / 3
         print(f"{time:.1f} seconds total, equalling to {time / num_seeds:.1f} seconds per seed")

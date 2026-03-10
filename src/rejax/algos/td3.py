@@ -10,18 +10,22 @@ from flax import nnx
 from jax import numpy as jnp
 
 from rejax.algos.utils import (
-    FloatObsWrapper,
     RewardRMSState,
     RMSState,
+    create_env,
+    make_eval_act,
+    maybe_update_targets,
+    normalize_minibatch,
     normalize_obs,
-    normalize_rew,
+    resolve_network_kwargs,
     update_rew_rms,
     update_rms,
 )
 from rejax.buffers import Minibatch, ReplayBuffer
-from rejax.compat import create
+from rejax.configs import TD3Config
 from rejax.evaluate import evaluate
 from rejax.networks import DeterministicPolicy, QNetwork
+from rejax.types import EnvParams, EvalMetrics, GymnaxEnv, TrainState
 
 
 NUM_CRITICS = 2
@@ -30,7 +34,6 @@ NUM_CRITICS = 2
 class TD3Carry(NamedTuple):
     """Non-module carry state for TD3 training."""
 
-    rng: chex.PRNGKey
     env_state: Any
     last_obs: chex.Array
     last_done: chex.Array
@@ -40,18 +43,9 @@ class TD3Carry(NamedTuple):
     rew_rms: RewardRMSState
 
 
-def _create_env(config):
-    if isinstance(config.env, str):
-        env, env_params = create(config.env)
-    else:
-        env = config.env
-        env_params = getattr(config, "env_params", None) or env.default_params
-    if config.normalize_observations:
-        env = FloatObsWrapper(env)
-    return env, env_params
-
-
-def _create_networks(config, env, env_params, rng):
+def _create_networks(
+    config: TD3Config, env: GymnaxEnv, env_params: EnvParams, rng: jax.Array
+) -> tuple[nnx.Optimizer, DeterministicPolicy, list[nnx.Optimizer], list[QNetwork]]:
     """Create actor, actor_target, twin critics, and twin critic targets."""
     obs_space = env.observation_space(env_params)
     action_space = env.action_space(env_params)
@@ -59,16 +53,7 @@ def _create_networks(config, env, env_params, rng):
     action_dim = int(np.prod(action_space.shape))
     action_range = (float(action_space.low), float(action_space.high))
 
-    # Actor kwargs
-    actor_kwargs = {}
-    if hasattr(config, "actor_kwargs") and config.actor_kwargs is not None:
-        import dataclasses
-
-        actor_kwargs = dataclasses.asdict(config.actor_kwargs)
-    activation = actor_kwargs.pop("activation", "swish")
-    actor_kwargs["activation"] = getattr(nnx, activation)
-    hidden_layer_sizes = actor_kwargs.pop("hidden_layer_sizes", (64, 64))
-    actor_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
+    actor_kwargs = resolve_network_kwargs(getattr(config, "actor_kwargs", None))
     actor_kwargs = {
         "in_features": in_features,
         "action_dim": action_dim,
@@ -76,16 +61,7 @@ def _create_networks(config, env, env_params, rng):
         **actor_kwargs,
     }
 
-    # Critic kwargs
-    critic_kwargs = {}
-    if hasattr(config, "critic_kwargs") and config.critic_kwargs is not None:
-        import dataclasses
-
-        critic_kwargs = dataclasses.asdict(config.critic_kwargs)
-    activation = critic_kwargs.pop("activation", "swish")
-    critic_kwargs["activation"] = getattr(nnx, activation)
-    hidden_layer_sizes = critic_kwargs.pop("hidden_layer_sizes", (64, 64))
-    critic_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
+    critic_kwargs = resolve_network_kwargs(getattr(config, "critic_kwargs", None))
     critic_kwargs = {
         "obs_dim": in_features,
         "action_dim": action_dim,
@@ -97,46 +73,36 @@ def _create_networks(config, env, env_params, rng):
         optax.adam(learning_rate=config.learning_rate),
     )
 
+    rngs = nnx.Rngs(rng)
+
     # Actor + actor target
-    rng, rng_actor, rng_actor_tgt = jax.random.split(rng, 3)
-    actor = DeterministicPolicy(**actor_kwargs, rngs=nnx.Rngs(rng_actor))
+    actor = DeterministicPolicy(**actor_kwargs, rngs=rngs)
     actor_optimizer = nnx.Optimizer(actor, tx)
 
-    actor_target = DeterministicPolicy(**actor_kwargs, rngs=nnx.Rngs(rng_actor_tgt))
+    actor_target = DeterministicPolicy(**actor_kwargs, rngs=rngs)
     nnx.update(actor_target, nnx.state(actor, nnx.Param))
 
     # Critics + critic targets
-    rng, rng_critics, rng_targets = jax.random.split(rng, 3)
-    rng_critics = jax.random.split(rng_critics, NUM_CRITICS)
-    rng_targets = jax.random.split(rng_targets, NUM_CRITICS)
-
     critic_opts = []
     critic_targets = []
-    for i in range(NUM_CRITICS):
-        critic = QNetwork(**critic_kwargs, rngs=nnx.Rngs(rng_critics[i]))
+    for _ in range(NUM_CRITICS):
+        critic = QNetwork(**critic_kwargs, rngs=rngs)
         critic_opts.append(nnx.Optimizer(critic, tx))
 
-        target = QNetwork(**critic_kwargs, rngs=nnx.Rngs(rng_targets[i]))
+        target = QNetwork(**critic_kwargs, rngs=rngs)
         nnx.update(target, nnx.state(critic, nnx.Param))
         critic_targets.append(target)
 
     return actor_optimizer, actor_target, critic_opts, critic_targets
 
 
-def _make_act(actor, config, obs_rms=None):
-    """Build eval policy closure (deterministic, no noise)."""
-
-    def act(obs, rng):
-        if config.normalize_observations and obs_rms is not None:
-            obs = normalize_obs(obs_rms, obs)
-        obs = jnp.expand_dims(obs, 0)
-        action = actor(obs)
-        return jnp.squeeze(action)
-
-    return act
-
-
-def train_td3(config, rng, *, env=None, env_params=None):
+def train_td3(
+    config: TD3Config,
+    rng: jax.Array,
+    *,
+    env: GymnaxEnv | None = None,
+    env_params: EnvParams = None,
+) -> tuple[TrainState, EvalMetrics]:
     """Train TD3. Designed to be JIT-able and vmap-able over rng.
 
     Args:
@@ -149,13 +115,7 @@ def train_td3(config, rng, *, env=None, env_params=None):
         (state_dict, eval_metrics) where state_dict contains trained NNX modules
     """
     # --- Setup ---
-    if env is None:
-        env, env_params = _create_env(config)
-    else:
-        if env_params is None:
-            env_params = env.default_params
-        if config.normalize_observations:
-            env = FloatObsWrapper(env)
+    env, env_params = create_env(config, env, env_params)
 
     num_envs = config.num_envs
     action_space = env.action_space(env_params)
@@ -167,13 +127,12 @@ def train_td3(config, rng, *, env=None, env_params=None):
     vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
     vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
-    # Create networks
-    rng, rng_net = jax.random.split(rng)
-    actor_optimizer, actor_target, critic_opts, critic_targets = _create_networks(config, env, env_params, rng_net)
+    # Create networks and rngs
+    rngs = nnx.Rngs(rng)
+    actor_optimizer, actor_target, critic_opts, critic_targets = _create_networks(config, env, env_params, rngs())
 
     # Init env
-    rng, rng_env = jax.random.split(rng)
-    obs, env_state = vmap_reset(jax.random.split(rng_env, num_envs), env_params)
+    obs, env_state = vmap_reset(jax.random.split(rngs(), num_envs), env_params)
 
     # Init normalization
     obs_rms = RMSState.create(obs_space.shape)
@@ -183,7 +142,6 @@ def train_td3(config, rng, *, env=None, env_params=None):
     buf = ReplayBuffer.empty(config.buffer_size, obs_space, action_space)
 
     carry = TD3Carry(
-        rng=rng,
         env_state=env_state,
         last_obs=obs,
         last_done=jnp.zeros(num_envs, dtype=bool),
@@ -194,9 +152,8 @@ def train_td3(config, rng, *, env=None, env_params=None):
     )
 
     # --- Collect transitions ---
-    def collect_transitions(carry, actor, uniform):
-        rng, rng_action = jax.random.split(carry.rng)
-        carry = carry._replace(rng=rng)
+    def collect_transitions(carry, actor, uniform, rngs):
+        rng_action = rngs()
 
         def sample_uniform(rng):
             return jax.vmap(action_space.sample)(jax.random.split(rng, num_envs))
@@ -211,9 +168,7 @@ def train_td3(config, rng, *, env=None, env_params=None):
 
         actions = jax.lax.cond(uniform, sample_uniform, sample_policy, rng_action)
 
-        rng, rng_steps = jax.random.split(carry.rng)
-        carry = carry._replace(rng=rng)
-        rng_steps = jax.random.split(rng_steps, num_envs)
+        rng_steps = jax.random.split(rngs(), num_envs)
         next_obs, new_env_state, rewards, dones, _ = vmap_step(rng_steps, carry.env_state, actions, env_params)
 
         obs_rms = carry.obs_rms
@@ -234,10 +189,10 @@ def train_td3(config, rng, *, env=None, env_params=None):
         return carry, mb
 
     # --- Update critics ---
-    def update_critics(carry, mb, actor_target, critic_opts, critic_targets):
+    def update_critics(mb, actor_target, critic_opts, critic_targets, rngs):
         action = actor_target(mb.next_obs)
         noise = jnp.clip(
-            config.target_noise * jax.random.normal(carry.rng, action.shape),
+            config.target_noise * jax.random.normal(rngs(), action.shape),
             -config.target_noise_clip,
             config.target_noise_clip,
         )
@@ -271,44 +226,36 @@ def train_td3(config, rng, *, env=None, env_params=None):
         actor_optimizer.update(grads)
 
     # --- Train critic phase (called policy_delay times) ---
-    def train_critic_phase(carry, actor_model, actor_target, critic_opts, critic_targets, placeholder_mb):
+    def train_critic_phase(carry, actor_model, actor_target, critic_opts, critic_targets, placeholder_mb, rngs):
         """Collect transitions + update critics. Returns stored minibatches for later actor update."""
         start_training = carry.global_step > config.fill_buffer
         uniform = jnp.logical_not(start_training)
 
-        carry, transitions = collect_transitions(carry, actor_model, uniform)
+        carry, transitions = collect_transitions(carry, actor_model, uniform, rngs)
         carry = carry._replace(replay_buffer=carry.replay_buffer.extend(transitions))
 
         # actor_target is read-only in update_critics
         def update_body(i, state):
-            carry, c_opts, c_tgts, minibatches = state
-            rng, rng_sample = jax.random.split(carry.rng)
-            carry = carry._replace(rng=rng)
-            minibatch = carry.replay_buffer.sample(config.batch_size, rng_sample)
-            if config.normalize_observations:
-                minibatch = minibatch._replace(
-                    obs=normalize_obs(carry.obs_rms, minibatch.obs),
-                    next_obs=normalize_obs(carry.obs_rms, minibatch.next_obs),
-                )
-            if config.normalize_rewards:
-                minibatch = minibatch._replace(reward=normalize_rew(carry.rew_rms, minibatch.reward))
-            update_critics(carry, minibatch, actor_target, c_opts, c_tgts)
+            carry, c_opts, c_tgts, minibatches, rngs = state
+            minibatch = carry.replay_buffer.sample(config.batch_size, rngs())
+            minibatch = normalize_minibatch(minibatch, config, carry.obs_rms, carry.rew_rms)
+            update_critics(minibatch, actor_target, c_opts, c_tgts, rngs)
             minibatches = jax.tree.map(lambda mb_all, m: mb_all.at[i].set(m), minibatches, minibatch)
-            return (carry, c_opts, c_tgts, minibatches)
+            return (carry, c_opts, c_tgts, minibatches, rngs)
 
-        def do_updates(carry, c_opts, c_tgts):
-            return nnx.fori_loop(0, config.num_epochs, update_body, (carry, c_opts, c_tgts, placeholder_mb))
+        def do_updates(carry, c_opts, c_tgts, rngs):
+            return nnx.fori_loop(0, config.num_epochs, update_body, (carry, c_opts, c_tgts, placeholder_mb, rngs))
 
-        def no_updates(carry, c_opts, c_tgts):
-            return (carry, c_opts, c_tgts, placeholder_mb)
+        def no_updates(carry, c_opts, c_tgts, rngs):
+            return (carry, c_opts, c_tgts, placeholder_mb, rngs)
 
-        carry, critic_opts, critic_targets, minibatches = nnx.cond(
-            start_training, do_updates, no_updates, carry, critic_opts, critic_targets
+        carry, critic_opts, critic_targets, minibatches, rngs = nnx.cond(
+            start_training, do_updates, no_updates, carry, critic_opts, critic_targets, rngs
         )
-        return carry, critic_opts, critic_targets, minibatches
+        return carry, critic_opts, critic_targets, minibatches, rngs
 
     # --- Train iteration ---
-    def train_iteration(carry, actor_optimizer, actor_target, critic_opts, critic_targets):
+    def train_iteration(carry, actor_optimizer, actor_target, critic_opts, critic_targets, rngs):
         old_global_step = carry.global_step
 
         # Create placeholder minibatch for index-based stacking
@@ -319,14 +266,14 @@ def train_td3(config, rng, *, env=None, env_params=None):
 
         # actor_optimizer.model and actor_target are read-only inside critic phase
         def policy_delay_body(_, state):
-            carry, minibatches, c_opts, c_tgts = state
-            carry, c_opts, c_tgts, minibatches = train_critic_phase(
-                carry, actor_optimizer.model, actor_target, c_opts, c_tgts, placeholder_mb
+            carry, minibatches, c_opts, c_tgts, rngs = state
+            carry, c_opts, c_tgts, minibatches, rngs = train_critic_phase(
+                carry, actor_optimizer.model, actor_target, c_opts, c_tgts, placeholder_mb, rngs
             )
-            return (carry, minibatches, c_opts, c_tgts)
+            return (carry, minibatches, c_opts, c_tgts, rngs)
 
-        carry, minibatches, critic_opts, critic_targets = nnx.fori_loop(
-            0, config.policy_delay, policy_delay_body, (carry, placeholder_mb, critic_opts, critic_targets)
+        carry, minibatches, critic_opts, critic_targets, rngs = nnx.fori_loop(
+            0, config.policy_delay, policy_delay_body, (carry, placeholder_mb, critic_opts, critic_targets, rngs)
         )
 
         # Update actor using stored minibatches
@@ -346,48 +293,20 @@ def train_td3(config, rng, *, env=None, env_params=None):
         actor_optimizer = nnx.cond(start_training, do_actor_updates, no_actor_updates, actor_optimizer)
 
         # Update target networks
-        if config.target_update_freq == 1:
-            # Polyak averaging
-            online_actor_params = nnx.state(actor_optimizer.model, nnx.Param)
-            target_actor_params = nnx.state(actor_target, nnx.Param)
-            updated_actor = jax.tree.map(
-                lambda o, t: config.polyak * t + (1 - config.polyak) * o,
-                online_actor_params,
-                target_actor_params,
-            )
-            nnx.update(actor_target, updated_actor)
+        online_models = [actor_optimizer.model] + [opt.model for opt in critic_opts]
+        target_models = [actor_target, *critic_targets]
+        updated_targets: list[nnx.Module] = maybe_update_targets(  # type: ignore[assignment]
+            online_models, target_models, config.polyak, config.target_update_freq, old_global_step, carry.global_step
+        )
+        actor_target = updated_targets[0]  # type: ignore[assignment]
+        critic_targets = updated_targets[1:]  # type: ignore[assignment]
 
-            for i in range(NUM_CRITICS):
-                online_params = nnx.state(critic_opts[i].model, nnx.Param)
-                target_params = nnx.state(critic_targets[i], nnx.Param)
-                updated = jax.tree.map(
-                    lambda o, t: config.polyak * t + (1 - config.polyak) * o,
-                    online_params,
-                    target_params,
-                )
-                nnx.update(critic_targets[i], updated)
-        else:
-            do_update = carry.global_step % config.target_update_freq <= old_global_step % config.target_update_freq
-
-            def _update(actor_tgt, c_tgts):
-                online_actor_params = nnx.state(actor_optimizer.model, nnx.Param)
-                nnx.update(actor_tgt, online_actor_params)
-                for i in range(NUM_CRITICS):
-                    online_params = nnx.state(critic_opts[i].model, nnx.Param)
-                    nnx.update(c_tgts[i], online_params)
-                return (actor_tgt, c_tgts)
-
-            def _no_update(actor_tgt, c_tgts):
-                return (actor_tgt, c_tgts)
-
-            actor_target, critic_targets = nnx.cond(do_update, _update, _no_update, actor_target, critic_targets)
-
-        return carry, actor_optimizer, actor_target, critic_opts, critic_targets
+        return carry, actor_optimizer, actor_target, critic_opts, critic_targets, rngs
 
     # --- Eval callback ---
-    def eval_callback(carry, actor_optimizer):
-        act_fn = _make_act(actor_optimizer.model, config, carry.obs_rms)
-        return evaluate(act_fn, carry.rng, env, env_params, 128, max_steps)
+    def eval_callback(carry, actor_optimizer, rngs):
+        act_fn = make_eval_act(lambda obs, rng: actor_optimizer.model(obs), config, carry.obs_rms)
+        return evaluate(act_fn, rngs(), env, env_params, 128, max_steps)
 
     # --- Outer training loop ---
     steps_per_train_it = num_envs * config.policy_delay
@@ -395,26 +314,26 @@ def train_td3(config, rng, *, env=None, env_params=None):
     num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
 
     if not config.skip_initial_evaluation:
-        initial_eval = eval_callback(carry, actor_optimizer)
+        initial_eval = eval_callback(carry, actor_optimizer, rngs)
 
     def eval_iteration(state, _):
-        carry, actor_opt, actor_tgt, c_opts, c_tgts = state
+        carry, actor_opt, actor_tgt, c_opts, c_tgts, rngs = state
 
         def train_body(_, s):
             return train_iteration(*s)
 
-        carry, actor_opt, actor_tgt, c_opts, c_tgts = nnx.fori_loop(
-            0, num_train_its_per_eval, train_body, (carry, actor_opt, actor_tgt, c_opts, c_tgts)
+        carry, actor_opt, actor_tgt, c_opts, c_tgts, rngs = nnx.fori_loop(
+            0, num_train_its_per_eval, train_body, (carry, actor_opt, actor_tgt, c_opts, c_tgts, rngs)
         )
-        metrics = eval_callback(carry, actor_opt)
-        return (carry, actor_opt, actor_tgt, c_opts, c_tgts), metrics
+        metrics = eval_callback(carry, actor_opt, rngs)
+        return (carry, actor_opt, actor_tgt, c_opts, c_tgts, rngs), metrics
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def scan_eval(state, _dummy):
         return eval_iteration(state, _dummy)
 
-    (carry, actor_optimizer, actor_target, critic_opts, critic_targets), all_metrics = scan_eval(
-        (carry, actor_optimizer, actor_target, critic_opts, critic_targets), jnp.zeros(num_evals)
+    (carry, actor_optimizer, actor_target, critic_opts, critic_targets, rngs), all_metrics = scan_eval(
+        (carry, actor_optimizer, actor_target, critic_opts, critic_targets, rngs), jnp.zeros(num_evals)
     )
 
     if not config.skip_initial_evaluation:

@@ -3,7 +3,6 @@
 from typing import Any, NamedTuple
 
 import chex
-import distrax
 import gymnax
 import jax
 import numpy as np
@@ -13,24 +12,27 @@ from jax import numpy as jnp
 from optax import linear_schedule
 
 from rejax.algos.utils import (
-    FloatObsWrapper,
     RewardRMSState,
     RMSState,
+    create_env,
+    make_eval_act,
+    maybe_update_targets,
+    normalize_minibatch,
     normalize_obs,
-    normalize_rew,
+    resolve_network_kwargs,
     update_rew_rms,
     update_rms,
 )
 from rejax.buffers import Minibatch, ReplayBuffer
-from rejax.compat import create
+from rejax.configs import IQNConfig
 from rejax.evaluate import evaluate
 from rejax.networks import ImplicitQuantileNetwork
+from rejax.types import EnvParams, EvalMetrics, GymnaxEnv, TrainState
 
 
 class IQNCarry(NamedTuple):
     """Non-module carry state for IQN training."""
 
-    rng: chex.PRNGKey
     env_state: Any
     last_obs: chex.Array
     last_done: chex.Array
@@ -40,28 +42,10 @@ class IQNCarry(NamedTuple):
     rew_rms: RewardRMSState
 
 
-def _create_env(config):
-    if isinstance(config.env, str):
-        env, env_params = create(config.env)
-    else:
-        env = config.env
-        env_params = getattr(config, "env_params", None) or env.default_params
-    if config.normalize_observations:
-        env = FloatObsWrapper(env)
-    return env, env_params
-
-
-def _create_networks(config, env, env_params, rng):
-    agent_kwargs = {}
-    if hasattr(config, "agent_kwargs") and config.agent_kwargs is not None:
-        import dataclasses
-
-        agent_kwargs = dataclasses.asdict(config.agent_kwargs)
-
-    activation = agent_kwargs.pop("activation", "swish")
-    agent_kwargs["activation"] = getattr(nnx, activation)
-    hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
-    agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
+def _create_networks(
+    config: IQNConfig, env: GymnaxEnv, env_params: EnvParams, rng: jax.Array
+) -> tuple[nnx.Optimizer, ImplicitQuantileNetwork]:
+    agent_kwargs = resolve_network_kwargs(getattr(config, "agent_kwargs", None))
 
     action_dim = env.action_space(env_params).n
     obs_space = env.observation_space(env_params)
@@ -69,9 +53,9 @@ def _create_networks(config, env, env_params, rng):
 
     q_kwargs = {"in_features": in_features, "action_dim": action_dim, **agent_kwargs}
 
-    rng, rng_q, rng_tgt = jax.random.split(rng, 3)
-    q_network = ImplicitQuantileNetwork(**q_kwargs, rngs=nnx.Rngs(rng_q))
-    q_target = ImplicitQuantileNetwork(**q_kwargs, rngs=nnx.Rngs(rng_tgt))
+    rngs = nnx.Rngs(rng)
+    q_network = ImplicitQuantileNetwork(**q_kwargs, rngs=rngs)
+    q_target = ImplicitQuantileNetwork(**q_kwargs, rngs=rngs)
 
     tx = optax.chain(
         optax.clip(config.max_grad_norm),
@@ -81,25 +65,15 @@ def _create_networks(config, env, env_params, rng):
     return q_optimizer, q_target
 
 
-def _make_act(q_network, config, obs_rms=None):
-    def act(obs, rng):
-        if config.normalize_observations and obs_rms is not None:
-            obs = normalize_obs(obs_rms, obs)
-        obs = jnp.expand_dims(obs, 0)
-        return jnp.squeeze(q_network.act(obs, rng, epsilon=0.005))
-
-    return act
-
-
-def train_iqn(config, rng, *, env=None, env_params=None):
+def train_iqn(
+    config: IQNConfig,
+    rng: jax.Array,
+    *,
+    env: GymnaxEnv | None = None,
+    env_params: EnvParams = None,
+) -> tuple[TrainState, EvalMetrics]:
     """Train IQN. Designed to be JIT-able and vmap-able over rng."""
-    if env is None:
-        env, env_params = _create_env(config)
-    else:
-        if env_params is None:
-            env_params = env.default_params
-        if config.normalize_observations:
-            env = FloatObsWrapper(env)
+    env, env_params = create_env(config, env, env_params)
 
     eps_schedule = linear_schedule(
         config.eps_start,
@@ -116,18 +90,16 @@ def train_iqn(config, rng, *, env=None, env_params=None):
     vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
     vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
-    rng, rng_net = jax.random.split(rng)
-    q_optimizer, q_target = _create_networks(config, env, env_params, rng_net)
+    rngs = nnx.Rngs(rng)
+    q_optimizer, q_target = _create_networks(config, env, env_params, rngs())
 
-    rng, rng_env = jax.random.split(rng)
-    obs, env_state = vmap_reset(jax.random.split(rng_env, num_envs), env_params)
+    obs, env_state = vmap_reset(jax.random.split(rngs(), num_envs), env_params)
 
     obs_rms = RMSState.create(obs_space.shape)
     rew_rms = RewardRMSState.create(num_envs)
     buf = ReplayBuffer.empty(config.buffer_size, obs_space, action_space)
 
     carry = IQNCarry(
-        rng=rng,
         env_state=env_state,
         last_obs=obs,
         last_done=jnp.zeros(num_envs, dtype=bool),
@@ -138,9 +110,8 @@ def train_iqn(config, rng, *, env=None, env_params=None):
     )
 
     # --- Collect transitions ---
-    def collect_transitions(carry, q_network, epsilon, uniform):
-        rng, rng_action = jax.random.split(carry.rng)
-        carry = carry._replace(rng=rng)
+    def collect_transitions(carry, q_network, epsilon, uniform, rngs):
+        rng_action = rngs()
 
         def sample_uniform(rng):
             return jax.vmap(action_space.sample)(jax.random.split(rng, num_envs))
@@ -153,9 +124,7 @@ def train_iqn(config, rng, *, env=None, env_params=None):
 
         actions = jax.lax.cond(uniform, sample_uniform, sample_policy, rng_action)
 
-        rng, rng_steps = jax.random.split(carry.rng)
-        carry = carry._replace(rng=rng)
-        rng_steps = jax.random.split(rng_steps, num_envs)
+        rng_steps = jax.random.split(rngs(), num_envs)
         next_obs, new_env_state, rewards, dones, _ = vmap_step(rng_steps, carry.env_state, actions, env_params)
 
         obs_rms = carry.obs_rms
@@ -176,10 +145,10 @@ def train_iqn(config, rng, *, env=None, env_params=None):
         return carry, mb
 
     # --- Update Q-network ---
-    def update_q(mb, q_optimizer, q_target, rng):
+    def update_q(mb, q_optimizer, q_target, rngs):
         q_network = q_optimizer.model
 
-        rng_action, rng_tau, rng_tau_prime = jax.random.split(rng, 3)
+        rng_action, rng_tau, rng_tau_prime = jax.random.split(rngs(), 3)
         rng_tau = jax.random.split(rng_tau, config.num_tau_samples)
         rng_tau_prime = jax.random.split(rng_tau_prime, config.num_tau_prime_samples)
 
@@ -214,86 +183,66 @@ def train_iqn(config, rng, *, env=None, env_params=None):
         q_optimizer.update(grads)
 
     # --- Train iteration ---
-    def train_iteration(carry, q_optimizer, q_target):
+    def train_iteration(carry, q_optimizer, q_target, rngs):
         start_training = carry.global_step > config.fill_buffer
         old_global_step = carry.global_step
 
         epsilon = eps_schedule(carry.global_step)
         uniform = jnp.logical_not(start_training)
-        carry, batch = collect_transitions(carry, q_optimizer.model, epsilon, uniform)
+        carry, batch = collect_transitions(carry, q_optimizer.model, epsilon, uniform, rngs)
         carry = carry._replace(replay_buffer=carry.replay_buffer.extend(batch))
 
         def update_iteration(_, state):
-            carry, q_opt, q_tgt = state
-            rng, rng_sample, rng_update = jax.random.split(carry.rng, 3)
-            carry = carry._replace(rng=rng)
-            minibatch = carry.replay_buffer.sample(config.batch_size, rng_sample)
-            if config.normalize_observations:
-                minibatch = minibatch._replace(
-                    obs=normalize_obs(carry.obs_rms, minibatch.obs),
-                    next_obs=normalize_obs(carry.obs_rms, minibatch.next_obs),
-                )
-            if config.normalize_rewards:
-                minibatch = minibatch._replace(reward=normalize_rew(carry.rew_rms, minibatch.reward))
-            update_q(minibatch, q_opt, q_tgt, rng_update)
-            return (carry, q_opt, q_tgt)
+            carry, q_opt, q_tgt, rngs = state
+            minibatch = carry.replay_buffer.sample(config.batch_size, rngs())
+            minibatch = normalize_minibatch(minibatch, config, carry.obs_rms, carry.rew_rms)
+            update_q(minibatch, q_opt, q_tgt, rngs)
+            return (carry, q_opt, q_tgt, rngs)
 
-        def do_updates(carry, q_opt, q_tgt):
-            return nnx.fori_loop(0, config.num_epochs, update_iteration, (carry, q_opt, q_tgt))
+        def do_updates(carry, q_opt, q_tgt, rngs):
+            return nnx.fori_loop(0, config.num_epochs, update_iteration, (carry, q_opt, q_tgt, rngs))
 
-        def no_updates(carry, q_opt, q_tgt):
-            return (carry, q_opt, q_tgt)
+        def no_updates(carry, q_opt, q_tgt, rngs):
+            return (carry, q_opt, q_tgt, rngs)
 
-        carry, q_optimizer, q_target = nnx.cond(start_training, do_updates, no_updates, carry, q_optimizer, q_target)
+        carry, q_optimizer, q_target, rngs = nnx.cond(
+            start_training, do_updates, no_updates, carry, q_optimizer, q_target, rngs
+        )
 
         # Update target network
-        q_network = q_optimizer.model
-        online_params = nnx.state(q_network, nnx.Param)
-        if config.target_update_freq == 1:
-            target_params = nnx.state(q_target, nnx.Param)
-            updated = jax.tree.map(lambda o, t: config.polyak * t + (1 - config.polyak) * o, online_params, target_params)
-            nnx.update(q_target, updated)
-        else:
-            do_update = carry.global_step % config.target_update_freq <= old_global_step % config.target_update_freq
+        q_target = maybe_update_targets(
+            q_optimizer.model, q_target, config.polyak, config.target_update_freq, old_global_step, carry.global_step
+        )
 
-            def _update(q_tgt):
-                nnx.update(q_tgt, online_params)
-                return q_tgt
-
-            def _no_update(q_tgt):
-                return q_tgt
-
-            q_target = nnx.cond(do_update, _update, _no_update, q_target)
-
-        return carry, q_optimizer, q_target
+        return carry, q_optimizer, q_target, rngs
 
     # --- Eval callback ---
-    def eval_callback(carry, q_optimizer):
-        act_fn = _make_act(q_optimizer.model, config, carry.obs_rms)
-        return evaluate(act_fn, carry.rng, env, env_params, 128, max_steps)
+    def eval_callback(carry, q_optimizer, rngs):
+        act_fn = make_eval_act(lambda obs, rng: q_optimizer.model.act(obs, rng, epsilon=0.005), config, carry.obs_rms)
+        return evaluate(act_fn, rngs(), env, env_params, 128, max_steps)
 
     # --- Outer training loop ---
     steps_per_iter = int(np.ceil(config.eval_freq / num_envs))
     num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
 
     if not config.skip_initial_evaluation:
-        initial_eval = eval_callback(carry, q_optimizer)
+        initial_eval = eval_callback(carry, q_optimizer, rngs)
 
     def eval_iteration(state, _):
-        carry, q_opt, q_tgt = state
+        carry, q_opt, q_tgt, rngs = state
 
         def train_body(_, s):
             return train_iteration(*s)
 
-        carry, q_opt, q_tgt = nnx.fori_loop(0, steps_per_iter, train_body, (carry, q_opt, q_tgt))
-        metrics = eval_callback(carry, q_opt)
-        return (carry, q_opt, q_tgt), metrics
+        carry, q_opt, q_tgt, rngs = nnx.fori_loop(0, steps_per_iter, train_body, (carry, q_opt, q_tgt, rngs))
+        metrics = eval_callback(carry, q_opt, rngs)
+        return (carry, q_opt, q_tgt, rngs), metrics
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def scan_eval(state, _dummy):
         return eval_iteration(state, _dummy)
 
-    (carry, q_optimizer, q_target), all_metrics = scan_eval((carry, q_optimizer, q_target), jnp.zeros(num_evals))
+    (carry, q_optimizer, q_target, rngs), all_metrics = scan_eval((carry, q_optimizer, q_target, rngs), jnp.zeros(num_evals))
 
     if not config.skip_initial_evaluation:
         all_metrics = jax.tree.map(

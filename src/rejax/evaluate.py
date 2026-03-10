@@ -1,29 +1,28 @@
-from collections.abc import Callable
 from functools import partial
 from typing import Any, NamedTuple
 
-import chex
 import jax
 import jax.numpy as jnp
-from gymnax.environments import environment
+
+from rejax.types import ActFn, EnvParams, EvalMetrics, GymnaxEnv
 
 
 class EvalState(NamedTuple):
-    rng: chex.PRNGKey
+    rng: jax.Array
     env_state: Any
-    last_obs: chex.Array
+    last_obs: jax.Array
     done: bool = False
     return_: float = 0.0
     length: int = 0
 
 
 def evaluate_single(
-    act: Callable[[chex.Array, chex.PRNGKey], chex.Array],  # act(obs, rng) -> action
-    env,
-    env_params,
-    rng,
-    max_steps_in_episode,
-):
+    act: ActFn,
+    env: GymnaxEnv,
+    env_params: EnvParams,
+    rng: jax.Array,
+    max_steps_in_episode: int,
+) -> tuple[jax.Array, jax.Array]:
     def step(state):
         rng, rng_act, rng_step = jax.random.split(state.rng, 3)
         action = act(state.last_obs, rng_act)
@@ -51,13 +50,13 @@ def evaluate_single(
 
 @partial(jax.jit, static_argnames=("act", "env", "num_seeds"))
 def evaluate(
-    act: Callable[[chex.Array, chex.PRNGKey], chex.Array],
-    rng: chex.PRNGKey,
-    env: environment.Environment,
-    env_params: Any,
+    act: ActFn,
+    rng: jax.Array,
+    env: GymnaxEnv,
+    env_params: EnvParams,
     num_seeds: int = 128,
     max_steps_in_episode: int | None = None,
-) -> tuple[chex.Array, chex.Array]:
+) -> EvalMetrics:
     """Evaluate a policy given by `act` on `num_seeds` environments.
 
     Args:

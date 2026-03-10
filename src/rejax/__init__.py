@@ -1,4 +1,4 @@
-from rejax.algos import Algorithm, train_dqn, train_iqn, train_ppo, train_pqn, train_sac, train_td3
+from rejax.algos import train_dqn, train_iqn, train_ppo, train_pqn, train_sac, train_td3
 from rejax.configs import (
     ALGO_CONFIG_MAP,
     DQNConfig,
@@ -9,9 +9,10 @@ from rejax.configs import (
     SACConfig,
     TD3Config,
 )
+from rejax.types import TrainFn
 
 
-_train_fns = {
+_train_fns: dict[str, TrainFn] = {
     "dqn": train_dqn,
     "iqn": train_iqn,
     "ppo": train_ppo,
@@ -21,7 +22,7 @@ _train_fns = {
 }
 
 
-def get_train_fn(algo: str):
+def get_train_fn(algo: str) -> TrainFn:
     """Get a standalone train function."""
     return _train_fns[algo]
 

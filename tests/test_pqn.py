@@ -33,10 +33,11 @@ def _get_q_network(state):
 
 
 def _make_act(state, config=None):
-    from rejax.algos.pqn import _make_act
+    from rejax.algos.utils import make_eval_act
 
     cfg = config or PQNConfig(**ARGS)
-    return _make_act(state["q_optimizer"].model, cfg, state.get("obs_rms_state"))
+    model = state["q_optimizer"].model
+    return make_eval_act(lambda obs, rng: model.act(obs, rng, epsilon=0.005), cfg, state.get("obs_rms_state"))
 
 
 def test_env1():

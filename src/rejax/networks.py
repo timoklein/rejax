@@ -48,7 +48,6 @@ class DiscretePolicy(nnx.Module):
     ):
         self.features = MLP(in_features, hidden_layer_sizes, activation, rngs)
         self.action_logits = nnx.Linear(hidden_layer_sizes[-1], action_dim, rngs=rngs)
-        self.rngs = rngs
 
     def _action_dist(self, obs: jax.Array) -> distrax.Categorical:
         features = self.features(obs)
@@ -92,7 +91,6 @@ class GaussianPolicy(nnx.Module):
         self.action_mean = nnx.Linear(hidden_layer_sizes[-1], action_dim, rngs=rngs)
         # Learnable log std parameter (not dependent on input)
         self.action_log_std = nnx.Param(jnp.zeros(action_dim))
-        self.rngs = rngs
 
     def _action_dist(self, obs: jax.Array) -> distrax.MultivariateNormalDiag:
         features = self.features(obs)
@@ -141,7 +139,6 @@ class SquashedGaussianPolicy(nnx.Module):
         self.action_mean = nnx.Linear(hidden_layer_sizes[-1], action_dim, rngs=rngs)
         self.action_log_std = nnx.Linear(hidden_layer_sizes[-1], action_dim, rngs=rngs)
         self.bij = distrax.Tanh()
-        self.rngs = rngs
 
     @property
     def action_loc(self) -> float:
@@ -181,7 +178,7 @@ class SquashedGaussianPolicy(nnx.Module):
 
         action_dist = self._action_dist(obs)
         action = (action - self.action_loc) / self.action_scale
-        action, log_det_j = self.bij.inverse_and_log_det(action)
+        action, log_det_j = self.bij.inverse_and_log_det(action)  # type: ignore[assignment]
         action_log_prob = action_dist.log_prob(action)
         action_log_prob += log_det_j.sum(axis=-1)
         return action_log_prob
@@ -208,7 +205,6 @@ class BetaPolicy(nnx.Module):
         self.features = MLP(in_features, hidden_layer_sizes, activation, rngs)
         self.alpha = nnx.Linear(hidden_layer_sizes[-1], action_dim, rngs=rngs)
         self.beta = nnx.Linear(hidden_layer_sizes[-1], action_dim, rngs=rngs)
-        self.rngs = rngs
 
     @property
     def action_loc(self) -> float:
@@ -427,8 +423,6 @@ class ImplicitQuantileNetwork(nnx.Module):
         # Combine state and quantile embeddings
         self.combine_dense = nnx.Linear(self.embedding_dim, 64, rngs=rngs)
         self.output_dense = nnx.Linear(64, action_dim, rngs=rngs)
-
-        self.rngs = rngs
 
     @property
     def embedding_dim(self) -> int:

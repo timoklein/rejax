@@ -11,17 +11,19 @@ from flax import nnx, struct
 from jax import numpy as jnp
 
 from rejax.algos.utils import (
-    FloatObsWrapper,
     RewardRMSState,
     RMSState,
-    normalize_obs,
+    create_env,
+    make_eval_act,
+    resolve_network_kwargs,
     shuffle_and_split,
     update_and_normalize_obs,
     update_and_normalize_rew,
 )
-from rejax.compat import create
+from rejax.configs import PPOConfig
 from rejax.evaluate import evaluate
 from rejax.networks import DiscretePolicy, GaussianPolicy, VNetwork
+from rejax.types import EnvParams, EvalMetrics, GymnaxEnv, TrainState
 
 
 class Trajectory(struct.PyTreeNode):
@@ -46,7 +48,6 @@ class AdvantageMinibatch(struct.PyTreeNode):
 class PPOCarry(NamedTuple):
     """Non-module carry state for PPO training."""
 
-    rng: chex.PRNGKey
     env_state: Any
     last_obs: chex.Array
     last_done: chex.Array
@@ -55,28 +56,10 @@ class PPOCarry(NamedTuple):
     rew_rms: RewardRMSState
 
 
-def _create_env(config):
-    if isinstance(config.env, str):
-        env, env_params = create(config.env)
-    else:
-        env = config.env
-        env_params = getattr(config, "env_params", None) or env.default_params
-    if config.normalize_observations:
-        env = FloatObsWrapper(env)
-    return env, env_params
-
-
-def _create_networks(config, env, env_params, rng):
-    agent_kwargs = {}
-    if hasattr(config, "agent_kwargs") and config.agent_kwargs is not None:
-        import dataclasses
-
-        agent_kwargs = dataclasses.asdict(config.agent_kwargs)
-
-    activation = agent_kwargs.pop("activation", "swish")
-    agent_kwargs["activation"] = getattr(nnx, activation)
-    hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
-    agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
+def _create_networks(
+    config: PPOConfig, env: GymnaxEnv, env_params: EnvParams, rng: jax.Array
+) -> tuple[nnx.Optimizer, nnx.Optimizer]:
+    agent_kwargs = resolve_network_kwargs(getattr(config, "agent_kwargs", None))
 
     action_space = env.action_space(env_params)
     obs_space = env.observation_space(env_params)
@@ -101,9 +84,9 @@ def _create_networks(config, env, env_params, rng):
 
     critic_kwargs = {"in_features": in_features, **agent_kwargs}
 
-    rng, rng_actor, rng_critic = jax.random.split(rng, 3)
-    actor = actor_cls(**actor_kwargs, rngs=nnx.Rngs(rng_actor))
-    critic = VNetwork(**critic_kwargs, rngs=nnx.Rngs(rng_critic))
+    rngs = nnx.Rngs(rng)
+    actor = actor_cls(**actor_kwargs, rngs=rngs)
+    critic = VNetwork(**critic_kwargs, rngs=rngs)
 
     tx = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
@@ -114,28 +97,15 @@ def _create_networks(config, env, env_params, rng):
     return actor_optimizer, critic_optimizer
 
 
-def _make_act(actor, config, obs_rms=None):
-    """Build eval policy closure."""
-
-    def act(obs, rng):
-        if config.normalize_observations and obs_rms is not None:
-            obs = normalize_obs(obs_rms, obs)
-        obs = jnp.expand_dims(obs, 0)
-        action = actor.act(obs, rng)
-        return jnp.squeeze(action)
-
-    return act
-
-
-def train_ppo(config, rng, *, env=None, env_params=None):
+def train_ppo(
+    config: PPOConfig,
+    rng: jax.Array,
+    *,
+    env: GymnaxEnv | None = None,
+    env_params: EnvParams = None,
+) -> tuple[TrainState, EvalMetrics]:
     """Train PPO. Designed to be JIT-able and vmap-able over rng."""
-    if env is None:
-        env, env_params = _create_env(config)
-    else:
-        if env_params is None:
-            env_params = env.default_params
-        if config.normalize_observations:
-            env = FloatObsWrapper(env)
+    env, env_params = create_env(config, env, env_params)
 
     num_envs = config.num_envs
     num_steps = config.num_steps
@@ -155,20 +125,18 @@ def train_ppo(config, rng, *, env=None, env_params=None):
         action_low = action_space.low
         action_high = action_space.high
 
-    # Create networks
-    rng, rng_net = jax.random.split(rng)
-    actor_optimizer, critic_optimizer = _create_networks(config, env, env_params, rng_net)
+    # Create networks and rngs
+    rngs = nnx.Rngs(rng)
+    actor_optimizer, critic_optimizer = _create_networks(config, env, env_params, rngs())
 
     # Init env
-    rng, rng_env = jax.random.split(rng)
-    obs, env_state = vmap_reset(jax.random.split(rng_env, num_envs), env_params)
+    obs, env_state = vmap_reset(jax.random.split(rngs(), num_envs), env_params)
 
     # Init normalization
     obs_rms = RMSState.create(obs_space.shape)
     rew_rms = RewardRMSState.create(num_envs)
 
     carry = PPOCarry(
-        rng=rng,
         env_state=env_state,
         last_obs=obs,
         last_done=jnp.zeros(num_envs, dtype=bool),
@@ -178,13 +146,13 @@ def train_ppo(config, rng, *, env=None, env_params=None):
     )
 
     # --- Collect trajectories ---
-    def collect_trajectories(carry, actor, critic):
-        """Roll out policy for num_steps. Actor/critic are read-only."""
+    def collect_trajectories(carry, actor, critic, rngs):
+        """Roll out policy for num_steps. Actor/critic are read-only.
+        Pre-split keys to keep jax.lax.scan (no module mutation needed)."""
+        step_keys = jax.random.split(rngs(), num_steps)
 
-        def env_step(carry, _):
-            rng, new_rng = jax.random.split(carry.rng)
-            carry = carry._replace(rng=rng)
-            rng_steps, rng_action = jax.random.split(new_rng, 2)
+        def env_step(carry, step_key):
+            rng_steps, rng_action = jax.random.split(step_key, 2)
             rng_steps = jax.random.split(rng_steps, num_envs)
 
             # Sample action
@@ -214,7 +182,7 @@ def train_ppo(config, rng, *, env=None, env_params=None):
             )
             return carry, transition
 
-        carry, trajectories = jax.lax.scan(env_step, carry, None, num_steps)
+        carry, trajectories = jax.lax.scan(env_step, carry, step_keys)
         return carry, trajectories
 
     # --- Calculate GAE ---
@@ -269,22 +237,20 @@ def train_ppo(config, rng, *, env=None, env_params=None):
         critic_optimizer.update(grads)
 
     # --- Train iteration ---
-    def train_iteration(carry, actor_optimizer, critic_optimizer):
+    def train_iteration(carry, actor_optimizer, critic_optimizer, rngs):
         actor = actor_optimizer.model
         critic = critic_optimizer.model
 
-        carry, trajectories = collect_trajectories(carry, actor, critic)
+        carry, trajectories = collect_trajectories(carry, actor, critic, rngs)
 
         last_val = critic(carry.last_obs)
         last_val = jnp.where(carry.last_done, 0, last_val)
         advantages, targets = calculate_gae(trajectories, last_val)
 
         def update_epoch(_, state):
-            carry, actor_opt, critic_opt = state
-            rng, minibatch_rng = jax.random.split(carry.rng)
-            carry = carry._replace(rng=rng)
+            actor_opt, critic_opt, rngs = state
             batch = AdvantageMinibatch(trajectories, advantages, targets)
-            minibatches = shuffle_and_split(batch, minibatch_rng, iteration_size, config.num_minibatches)
+            minibatches = shuffle_and_split(batch, rngs(), iteration_size, config.num_minibatches)
 
             @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
             def update_step(state, mb):
@@ -294,17 +260,17 @@ def train_ppo(config, rng, *, env=None, env_params=None):
                 return (actor_opt, critic_opt)
 
             actor_opt, critic_opt = update_step((actor_opt, critic_opt), minibatches)
-            return (carry, actor_opt, critic_opt)
+            return (actor_opt, critic_opt, rngs)
 
-        carry, actor_optimizer, critic_optimizer = nnx.fori_loop(
-            0, config.num_epochs, update_epoch, (carry, actor_optimizer, critic_optimizer)
+        actor_optimizer, critic_optimizer, rngs = nnx.fori_loop(
+            0, config.num_epochs, update_epoch, (actor_optimizer, critic_optimizer, rngs)
         )
-        return carry, actor_optimizer, critic_optimizer
+        return carry, actor_optimizer, critic_optimizer, rngs
 
     # --- Eval callback ---
-    def eval_callback(carry, actor_optimizer):
-        act_fn = _make_act(actor_optimizer.model, config, carry.obs_rms)
-        return evaluate(act_fn, carry.rng, env, env_params, 128, max_steps)
+    def eval_callback(carry, actor_optimizer, rngs):
+        act_fn = make_eval_act(lambda obs, rng: actor_optimizer.model.act(obs, rng), config, carry.obs_rms)
+        return evaluate(act_fn, rngs(), env, env_params, 128, max_steps)
 
     # --- Outer training loop ---
     iteration_steps = num_envs * num_steps
@@ -312,24 +278,26 @@ def train_ppo(config, rng, *, env=None, env_params=None):
     num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
 
     if not config.skip_initial_evaluation:
-        initial_eval = eval_callback(carry, actor_optimizer)
+        initial_eval = eval_callback(carry, actor_optimizer, rngs)
 
     def eval_iteration(state, _):
-        carry, actor_opt, critic_opt = state
+        carry, actor_opt, critic_opt, rngs = state
 
         def train_body(_, s):
             return train_iteration(*s)
 
-        carry, actor_opt, critic_opt = nnx.fori_loop(0, num_iters_per_eval, train_body, (carry, actor_opt, critic_opt))
-        metrics = eval_callback(carry, actor_opt)
-        return (carry, actor_opt, critic_opt), metrics
+        carry, actor_opt, critic_opt, rngs = nnx.fori_loop(
+            0, num_iters_per_eval, train_body, (carry, actor_opt, critic_opt, rngs)
+        )
+        metrics = eval_callback(carry, actor_opt, rngs)
+        return (carry, actor_opt, critic_opt, rngs), metrics
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def scan_eval(state, _dummy):
         return eval_iteration(state, _dummy)
 
-    (carry, actor_optimizer, critic_optimizer), all_metrics = scan_eval(
-        (carry, actor_optimizer, critic_optimizer), jnp.zeros(num_evals)
+    (carry, actor_optimizer, critic_optimizer, rngs), all_metrics = scan_eval(
+        (carry, actor_optimizer, critic_optimizer, rngs), jnp.zeros(num_evals)
     )
 
     if not config.skip_initial_evaluation:

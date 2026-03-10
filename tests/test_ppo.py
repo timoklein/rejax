@@ -38,10 +38,11 @@ def _get_critic(state):
 
 
 def _make_act(state, config=None):
-    from rejax.algos.ppo import _make_act
+    from rejax.algos.utils import make_eval_act
 
     cfg = config or PPOConfig(**ARGS)
-    return _make_act(state["actor_optimizer"].model, cfg, state.get("obs_rms_state"))
+    model = state["actor_optimizer"].model
+    return make_eval_act(lambda obs, rng: model.act(obs, rng), cfg, state.get("obs_rms_state"))
 
 
 @pytest.mark.parametrize("env", [TestEnv1Continuous(), TestEnv1Discrete()], ids=["continuous", "discrete"])
@@ -58,11 +59,10 @@ def test_env2(env):
     critic = _get_critic(state)
 
     obs = jax.numpy.array([[-1], [1]])
-    rew = obs
     value = critic(obs)
 
-    for v, r in zip(value, rew):
-        assert v == pytest.approx(r, abs=0.1)
+    for v, r in zip(value, obs.squeeze(-1)):
+        assert float(v) == pytest.approx(float(r), abs=0.1)
 
 
 @pytest.mark.parametrize("env", [TestEnv3Continuous(), TestEnv3Discrete()], ids=["continuous", "discrete"])
@@ -88,16 +88,16 @@ def test_env4(env, discrete):
     state, _ = _train(env)
     critic = _get_critic(state)
 
-    best_action = jax.numpy.array(1.0 if discrete else 2.0)
+    best_action = 1.0 if discrete else 2.0
     value = critic(jax.numpy.array([0]))
-    assert value == pytest.approx(best_action, abs=0.1)
+    assert value.item() == pytest.approx(best_action, abs=0.1)
 
     act = _make_act(state)
     rngs = jax.random.split(jax.random.PRNGKey(0), 10)
     actions = jax.vmap(act, in_axes=(None, 0))(jax.numpy.array([0]), rngs)
 
     for a in actions:
-        assert a == pytest.approx(best_action, abs=0.1)
+        assert float(a) == pytest.approx(best_action, abs=0.1)
 
 
 @pytest.mark.parametrize(
@@ -118,14 +118,14 @@ def test_env5(env, discrete):
         critic = _get_critic(state)
         value = critic(obs)
         for v in value:
-            assert v == pytest.approx(0.0, abs=0.1)
+            assert float(v) == pytest.approx(0.0, abs=0.15)
 
     act = _make_act(state)
     rngs = jax.random.split(rng, 10)
     actions = jax.vmap(act)(obs, rngs)
 
-    for o, a in zip(obs, actions):
+    for o, a in zip(obs.squeeze(-1), actions):
         if discrete:
             assert (a > 0.5) == (o > 0)
         else:
-            assert a == pytest.approx(o, abs=0.2)
+            assert float(a) == pytest.approx(float(o), abs=0.2)

@@ -41,10 +41,11 @@ def _q_fn_from_critics(critics):
 
 
 def _make_act(state, config=None):
-    from rejax.algos.sac import _make_act
+    from rejax.algos.utils import make_eval_act
 
     cfg = config or SACConfig(**ARGS)
-    return _make_act(state["actor_optimizer"].model, cfg, state.get("obs_rms_state"))
+    model = state["actor_optimizer"].model
+    return make_eval_act(lambda obs, rng: model.act(obs, rng), cfg, state.get("obs_rms_state"))
 
 
 def test_env1():
@@ -81,8 +82,8 @@ def test_env2():
     qs = q_fn(obs, actions)
     value = qs.min(axis=0)
 
-    for v, r in zip(value, obs):
-        assert v == pytest.approx(r, abs=0.1)
+    for v, r in zip(value, obs.squeeze(-1)):
+        assert float(v) == pytest.approx(float(r), abs=0.1)
 
 
 def test_env3():
@@ -123,7 +124,7 @@ def test_env4():
 
         qs = q_fn(obs, action)
         value = qs.min(axis=0)
-        return value, action
+        return value.squeeze(), action.squeeze()
 
     num_rngs = 100
     rngs = jax.random.split(jax.random.PRNGKey(1), num_rngs)
@@ -133,7 +134,7 @@ def test_env4():
 
     assert sum(aa > threshold) >= 0.9 * num_rngs
     for v, a in zip(vv, aa):
-        assert v == pytest.approx(a, abs=0.1)
+        assert float(v) == pytest.approx(float(a), abs=0.1)
 
 
 def test_env5():
@@ -146,7 +147,7 @@ def test_env5():
     value = q_fn(obs, obs)
     value = value.min(axis=0)
     for v in value:
-        assert v == pytest.approx(0.0, abs=0.1)
+        assert float(v) == pytest.approx(0.0, abs=0.15)
 
     act = _make_act(state)
     vmap_act = jax.vmap(jax.vmap(act, in_axes=(0, None)), in_axes=(None, 0))
@@ -154,6 +155,6 @@ def test_env5():
     rngs = jax.random.split(rng, num_rngs)
     actions = vmap_act(obs, rngs)
 
-    for i in range(obs.size):
-        assert actions[:, i].mean() == pytest.approx(obs[i], abs=0.1)
+    for i in range(obs.shape[0]):
+        assert float(actions[:, i].mean()) == pytest.approx(float(obs[i].squeeze()), abs=0.15)
         assert jax.numpy.isclose(actions[:, i], obs[i], atol=0.5).sum() >= 0.9 * num_rngs

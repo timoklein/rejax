@@ -10,8 +10,7 @@ import pandas as pd
 import tyro
 from flax import serialization
 
-from rejax import ALGO_CONFIG_MAP, get_algo
-from rejax.evaluate import make_evaluate as make_evaluate_vanilla
+from rejax import ALGO_CONFIG_MAP, get_train_fn
 
 
 class Logger:
@@ -106,36 +105,6 @@ class Logger:
         self.last_time = self.timer
 
 
-def make_evaluate(logger, env, env_params, num_seeds=20):
-    evaluate_vanilla = make_evaluate_vanilla(env, env_params, num_seeds)
-
-    def log_with_garbage_return(data, step):
-        logger.log(data, step)
-        return jnp.empty(()), jnp.empty(())  # garbage
-
-    def evaluate(config, ts, rng):
-        lengths, returns = evaluate_vanilla(config, ts, rng)
-        garbage = jax.experimental.io_callback(
-            log_with_garbage_return,
-            (jnp.empty(()), jnp.empty(())),
-            # Take mean over evaluation seeds
-            {
-                "episode_length": lengths.mean(axis=0),
-                "episode_length_std": lengths.std(axis=0),
-                "episode_length_max": lengths.max(axis=0),
-                "episode_length_min": lengths.min(axis=0),
-                "return": returns.mean(axis=0),
-                "return_std": returns.std(axis=0),
-                "return_max": returns.max(axis=0),
-                "return_min": returns.min(axis=0),
-            },
-            ts.global_step,
-        )
-        return garbage
-
-    return evaluate
-
-
 def main(args, config):
     config_dict = dataclasses.asdict(config)
 
@@ -159,19 +128,16 @@ def main(args, config):
             name=log_name,
         )
 
-    # Prepare train function and config
-    algo_cls = get_algo(args.algorithm)
-    train_config = algo_cls.create(**config_dict)
-    evaluate = make_evaluate(logger, train_config.env, train_config.env_params)
-    train_config = train_config.replace(eval_callback=evaluate)
+    # Prepare train function
+    train_fn = get_train_fn(args.algorithm)
 
     key = jax.random.PRNGKey(args.global_seed)
     keys = jax.random.split(key, args.num_seeds)
-    vmap_train = jax.jit(jax.vmap(algo_cls.train, in_axes=(None, 0)))
+    vmap_train = jax.jit(jax.vmap(train_fn, in_axes=(None, 0)), static_argnums=(0,))
 
     # Time compilation
     start = time.process_time()
-    lowered = vmap_train.lower(train_config, keys)
+    lowered = vmap_train.lower(config, keys)
     time_lower = time.process_time() - start
     compiled = lowered.compile()
     time_compile = time.process_time() - time_lower
@@ -187,7 +153,15 @@ def main(args, config):
 
     # Train
     logger.reset_timer()
-    train_state, _ = vmap_train(train_config, keys)
+    train_state, (lengths, returns) = vmap_train(config, keys)
+    # Log final results
+    logger.log(
+        {
+            "return": returns.mean(axis=-1)[:, -1].tolist(),
+            "episode_length": lengths.mean(axis=-1)[:, -1].tolist(),
+        },
+        jnp.array(config.total_timesteps),
+    )
     logger.collect_log_step()
     logger.write_log()
     if args.save_all_checkpoints:

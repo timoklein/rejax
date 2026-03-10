@@ -41,10 +41,11 @@ def _q_fn_from_critics(critics):
 
 
 def _make_act(state, config=None):
-    from rejax.algos.td3 import _make_act
+    from rejax.algos.utils import make_eval_act
 
     cfg = config or TD3Config(**ARGS)
-    return _make_act(state["actor_optimizer"].model, cfg, state.get("obs_rms_state"))
+    model = state["actor_optimizer"].model
+    return make_eval_act(lambda obs, rng: model(obs), cfg, state.get("obs_rms_state"))
 
 
 def test_env1():
@@ -80,8 +81,8 @@ def test_env2():
     qs = q_fn(obs, actions)
     value = qs.min(axis=0)
 
-    for v, r in zip(value, obs):
-        assert v == pytest.approx(r, abs=0.1)
+    for v, r in zip(value, obs.squeeze(-1)):
+        assert float(v) == pytest.approx(float(r), abs=0.1)
 
 
 def test_env3():
