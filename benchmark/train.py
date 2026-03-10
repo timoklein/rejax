@@ -153,7 +153,9 @@ def main(args, config):
 
     # Train
     logger.reset_timer()
-    train_state, (lengths, returns) = vmap_train(config, keys)
+    train_state, metrics = vmap_train(config, keys)
+    returns = metrics["eval_returns"]
+    lengths = metrics["eval_lengths"]
     # Log final results
     logger.log(
         {

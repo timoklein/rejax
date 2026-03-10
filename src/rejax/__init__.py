@@ -9,7 +9,7 @@ from rejax.configs import (
     SACConfig,
     TD3Config,
 )
-from rejax.types import TrainFn
+from rejax.types import Metrics, TrainFn
 
 
 _train_fns: dict[str, TrainFn] = {
@@ -31,6 +31,7 @@ __all__ = [
     "ALGO_CONFIG_MAP",
     "DQNConfig",
     "IQNConfig",
+    "Metrics",
     "NetworkConfig",
     "PPOConfig",
     "PQNConfig",

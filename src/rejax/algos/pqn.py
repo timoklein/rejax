@@ -9,6 +9,7 @@ Dimension key:
     T: trajectory length (num_steps)
 """
 
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import chex
@@ -33,7 +34,7 @@ from rejax.algos.utils import (
 from rejax.configs import PQNConfig
 from rejax.evaluate import evaluate
 from rejax.networks import DiscreteQNetwork
-from rejax.types import EnvParams, EvalMetrics, GymnaxEnv, TrainState
+from rejax.types import EnvParams, GymnaxEnv, Metrics, TrainState
 
 
 class Trajectory(struct.PyTreeNode):
@@ -53,6 +54,9 @@ class TargetMinibatch(struct.PyTreeNode):
     targets: chex.Array
 
 
+_PQN_METRIC_NAMES = ("td_loss", "mean_q_value", "epsilon")
+
+
 class PQNCarry(NamedTuple):
     """Non-module carry state for PQN training."""
 
@@ -62,6 +66,8 @@ class PQNCarry(NamedTuple):
     global_step: int
     obs_rms: RMSState
     rew_rms: RewardRMSState
+    train_metrics: dict
+    metrics_count: int
 
 
 def _create_networks(config: PQNConfig, env: GymnaxEnv, env_params: EnvParams, rng: jax.Array) -> nnx.Optimizer:
@@ -90,7 +96,8 @@ def train_pqn(
     *,
     env: GymnaxEnv | None = None,
     env_params: EnvParams = None,
-) -> tuple[TrainState, EvalMetrics]:
+    log_fn: Callable[..., None] | None = None,
+) -> tuple[TrainState, Metrics]:
     """Train PQN. Designed to be JIT-able and vmap-able over rng.
 
     Args:
@@ -136,6 +143,8 @@ def train_pqn(
     obs_rms = RMSState.create(obs_space.shape)
     rew_rms = RewardRMSState.create(num_envs)
 
+    zero_train_metrics = {k: jnp.float32(0.0) for k in _PQN_METRIC_NAMES}
+
     carry = PQNCarry(
         env_state=env_state,
         last_obs=obs,
@@ -143,6 +152,8 @@ def train_pqn(
         global_step=0,
         obs_rms=obs_rms,
         rew_rms=rew_rms,
+        train_metrics=zero_train_metrics,
+        metrics_count=0,
     )
 
     # --- Collect trajectories ---
@@ -213,10 +224,11 @@ def train_pqn(
 
         def loss_fn(model):
             q_B = model.take(tr.obs, tr.action)
-            return optax.l2_loss(q_B, ta).mean()
+            return optax.l2_loss(q_B, ta).mean(), q_B.mean()
 
-        _loss, grads = nnx.value_and_grad(loss_fn)(q_network)
+        (loss, mean_q), grads = nnx.value_and_grad(loss_fn, has_aux=True)(q_network)
         q_optimizer.update(grads)
+        return loss, mean_q
 
     # --- Train iteration ---
     def train_iteration(carry, q_optimizer, rngs):
@@ -229,21 +241,39 @@ def train_pqn(
         max_last_q_B = jnp.where(carry.last_done, 0, max_last_q_B)
         targets = calculate_targets(trajectories, max_last_q_B)
 
+        epsilon = eps_schedule(carry.global_step)
+        zero_update_metrics = {"td_loss": jnp.float32(0.0), "mean_q_value": jnp.float32(0.0)}
+
         def update_epoch(_, state):
-            q_opt, rngs = state
+            q_opt, rngs, metrics_sum = state
 
             batch = TargetMinibatch(trajectories, targets)
             minibatches = shuffle_and_split(batch, rngs(), iteration_size, config.num_minibatches)
 
-            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
             def update_step(q_opt, mb):
-                update_q(mb, q_opt)
-                return q_opt
+                td_loss, mean_q = update_q(mb, q_opt)
+                return q_opt, {"td_loss": td_loss, "mean_q_value": mean_q}
 
-            q_opt = update_step(q_opt, minibatches)
-            return (q_opt, rngs)
+            q_opt, mb_metrics = update_step(q_opt, minibatches)
+            epoch_metrics = jax.tree.map(jnp.mean, mb_metrics)
+            metrics_sum = jax.tree.map(lambda s, e: s + e, metrics_sum, epoch_metrics)
+            return (q_opt, rngs, metrics_sum)
 
-        q_optimizer, rngs = nnx.fori_loop(0, config.num_epochs, update_epoch, (q_optimizer, rngs))
+        q_optimizer, rngs, epoch_metrics_sum = nnx.fori_loop(
+            0, config.num_epochs, update_epoch, (q_optimizer, rngs, zero_update_metrics)
+        )
+
+        # Average over epochs, add epsilon
+        iter_metrics = jax.tree.map(lambda s: s / config.num_epochs, epoch_metrics_sum)
+        iter_metrics["epsilon"] = epsilon
+
+        # Accumulate in carry
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda s, m: s + m, carry.train_metrics, iter_metrics),
+            metrics_count=carry.metrics_count + 1,
+        )
+
         return carry, q_optimizer, rngs
 
     # --- Eval callback ---
@@ -257,7 +287,15 @@ def train_pqn(
     num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
 
     if not config.skip_initial_evaluation:
-        initial_eval = eval_callback(carry, q_optimizer, rngs)
+        eval_lengths, eval_returns = eval_callback(carry, q_optimizer, rngs)
+        initial_metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(0),
+            **{k: jnp.float32(0.0) for k in _PQN_METRIC_NAMES},
+        }
+        if log_fn is not None:
+            jax.debug.callback(log_fn, initial_metrics)
 
     def eval_iteration(state, _):
         carry, q_opt, rngs = state
@@ -266,7 +304,28 @@ def train_pqn(
             return train_iteration(*s)
 
         carry, q_opt, rngs = nnx.fori_loop(0, num_iters_per_eval, train_body, (carry, q_opt, rngs))
-        metrics = eval_callback(carry, q_opt, rngs)
+
+        # Average training metrics
+        count = jnp.maximum(carry.metrics_count, 1)
+        avg_tm = jax.tree.map(lambda s: s / count, carry.train_metrics)
+
+        eval_lengths, eval_returns = eval_callback(carry, q_opt, rngs)
+        metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(carry.global_step),
+            **avg_tm,
+        }
+
+        if log_fn is not None:
+            jax.debug.callback(log_fn, metrics)
+
+        # Reset accumulator (use traced ops to preserve nnx.scan carry references)
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda x: x * 0, carry.train_metrics),
+            metrics_count=carry.metrics_count * 0,
+        )
+
         return (carry, q_opt, rngs), metrics
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
@@ -278,7 +337,7 @@ def train_pqn(
     if not config.skip_initial_evaluation:
         all_metrics = jax.tree.map(
             lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
-            initial_eval,
+            initial_metrics,
             all_metrics,
         )
 

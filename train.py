@@ -17,7 +17,8 @@ def main(algo_str: str, config: object, seed_id: int, num_seeds: int, time_fit: 
     keys = jax.random.split(key, num_seeds)
 
     vmap_train = jax.jit(jax.vmap(train_fn, in_axes=(None, 0)), static_argnums=(0,))
-    state, (lengths, returns) = vmap_train(config, keys)
+    state, metrics = vmap_train(config, keys)
+    returns = metrics["eval_returns"]
     returns.block_until_ready()
 
     print(f"Achieved mean return of {returns.mean(axis=-1)[:, -1]}")

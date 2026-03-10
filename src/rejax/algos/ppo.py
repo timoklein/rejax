@@ -6,6 +6,7 @@ Dimension key:
     T: trajectory length (num_steps)
 """
 
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import chex
@@ -29,7 +30,7 @@ from rejax.algos.utils import (
 from rejax.configs import PPOConfig
 from rejax.evaluate import evaluate
 from rejax.networks import DiscretePolicy, GaussianPolicy, VNetwork
-from rejax.types import EnvParams, EvalMetrics, GymnaxEnv, TrainState
+from rejax.types import EnvParams, GymnaxEnv, Metrics, TrainState
 
 
 class Trajectory(struct.PyTreeNode):
@@ -60,6 +61,8 @@ class PPOCarry(NamedTuple):
     global_step: int
     obs_rms: RMSState
     rew_rms: RewardRMSState
+    train_metrics: dict
+    metrics_count: int
 
 
 def _create_networks(
@@ -103,13 +106,17 @@ def _create_networks(
     return actor_optimizer, critic_optimizer
 
 
+_PPO_METRIC_NAMES = ("actor_loss", "critic_loss", "entropy", "clip_fraction", "approx_kl", "explained_variance")
+
+
 def train_ppo(
     config: PPOConfig,
     rng: jax.Array,
     *,
     env: GymnaxEnv | None = None,
     env_params: EnvParams = None,
-) -> tuple[TrainState, EvalMetrics]:
+    log_fn: Callable[..., None] | None = None,
+) -> tuple[TrainState, Metrics]:
     """Train PPO. Designed to be JIT-able and vmap-able over rng."""
     env, env_params = create_env(config, env, env_params)
 
@@ -142,6 +149,8 @@ def train_ppo(
     obs_rms = RMSState.create(obs_space.shape)
     rew_rms = RewardRMSState.create(num_envs)
 
+    zero_train_metrics = {k: jnp.float32(0.0) for k in _PPO_METRIC_NAMES}
+
     carry = PPOCarry(
         env_state=env_state,
         last_obs=obs,
@@ -149,6 +158,8 @@ def train_ppo(
         global_step=0,
         obs_rms=obs_rms,
         rew_rms=rew_rms,
+        train_metrics=zero_train_metrics,
+        metrics_count=0,
     )
 
     # --- Collect trajectories ---
@@ -220,10 +231,13 @@ def train_ppo(
             pi_loss1_B = ratio_B * adv_B
             pi_loss2_B = clipped_ratio_B * adv_B
             pi_loss = -jnp.minimum(pi_loss1_B, pi_loss2_B).mean()
-            return pi_loss - config.ent_coef * entropy
+            clip_fraction = jnp.mean(jnp.abs(ratio_B - 1) > config.clip_eps)
+            approx_kl = jnp.mean((ratio_B - 1) - jnp.log(ratio_B))
+            return pi_loss - config.ent_coef * entropy, (pi_loss, entropy, clip_fraction, approx_kl)
 
-        _loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
+        (_loss, (pi_loss, entropy, clip_fraction, approx_kl)), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(actor)
         actor_optimizer.update(grads)
+        return pi_loss, entropy, clip_fraction, approx_kl
 
     # --- Update critic ---
     def update_critic(batch, critic_optimizer):
@@ -239,8 +253,9 @@ def train_ppo(
             value_loss = 0.5 * jnp.maximum(loss_B, loss_clipped_B).mean()
             return config.vf_coef * value_loss
 
-        _loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
+        loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
         critic_optimizer.update(grads)
+        return loss
 
     # --- Train iteration ---
     def train_iteration(carry, actor_optimizer, critic_optimizer, rngs):
@@ -253,24 +268,49 @@ def train_ppo(
         last_val_B = jnp.where(carry.last_done, 0, last_val_B)
         advantages, targets = calculate_gae(trajectories, last_val_B)
 
+        # Explained variance (computed before updates modify critic)
+        explained_var = 1 - jnp.var(targets - trajectories.value) / (jnp.var(targets) + 1e-8)
+
+        update_metric_names = ("actor_loss", "critic_loss", "entropy", "clip_fraction", "approx_kl")
+        zero_update_metrics = {k: jnp.float32(0.0) for k in update_metric_names}
+
         def update_epoch(_, state):
-            actor_opt, critic_opt, rngs = state
+            actor_opt, critic_opt, rngs, metrics_sum = state
             batch = AdvantageMinibatch(trajectories, advantages, targets)
             minibatches = shuffle_and_split(batch, rngs(), iteration_size, config.num_minibatches)
 
-            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
             def update_step(state, mb):
                 actor_opt, critic_opt = state
-                update_actor(mb, actor_opt)
-                update_critic(mb, critic_opt)
-                return (actor_opt, critic_opt)
+                actor_loss, entropy, clip_fraction, approx_kl = update_actor(mb, actor_opt)
+                critic_loss = update_critic(mb, critic_opt)
+                return (actor_opt, critic_opt), {
+                    "actor_loss": actor_loss,
+                    "critic_loss": critic_loss,
+                    "entropy": entropy,
+                    "clip_fraction": clip_fraction,
+                    "approx_kl": approx_kl,
+                }
 
-            actor_opt, critic_opt = update_step((actor_opt, critic_opt), minibatches)
-            return (actor_opt, critic_opt, rngs)
+            (actor_opt, critic_opt), mb_metrics = update_step((actor_opt, critic_opt), minibatches)
+            epoch_metrics = jax.tree.map(jnp.mean, mb_metrics)
+            metrics_sum = jax.tree.map(lambda s, e: s + e, metrics_sum, epoch_metrics)
+            return (actor_opt, critic_opt, rngs, metrics_sum)
 
-        actor_optimizer, critic_optimizer, rngs = nnx.fori_loop(
-            0, config.num_epochs, update_epoch, (actor_optimizer, critic_optimizer, rngs)
+        actor_optimizer, critic_optimizer, rngs, epoch_metrics_sum = nnx.fori_loop(
+            0, config.num_epochs, update_epoch, (actor_optimizer, critic_optimizer, rngs, zero_update_metrics)
         )
+
+        # Average over epochs, add explained variance
+        iter_metrics = jax.tree.map(lambda s: s / config.num_epochs, epoch_metrics_sum)
+        iter_metrics["explained_variance"] = explained_var
+
+        # Accumulate in carry
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda s, m: s + m, carry.train_metrics, iter_metrics),
+            metrics_count=carry.metrics_count + 1,
+        )
+
         return carry, actor_optimizer, critic_optimizer, rngs
 
     # --- Eval callback ---
@@ -284,7 +324,15 @@ def train_ppo(
     num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
 
     if not config.skip_initial_evaluation:
-        initial_eval = eval_callback(carry, actor_optimizer, rngs)
+        eval_lengths, eval_returns = eval_callback(carry, actor_optimizer, rngs)
+        initial_metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(0),
+            **{k: jnp.float32(0.0) for k in _PPO_METRIC_NAMES},
+        }
+        if log_fn is not None:
+            jax.debug.callback(log_fn, initial_metrics)
 
     def eval_iteration(state, _):
         carry, actor_opt, critic_opt, rngs = state
@@ -295,7 +343,28 @@ def train_ppo(
         carry, actor_opt, critic_opt, rngs = nnx.fori_loop(
             0, num_iters_per_eval, train_body, (carry, actor_opt, critic_opt, rngs)
         )
-        metrics = eval_callback(carry, actor_opt, rngs)
+
+        # Average training metrics
+        count = jnp.maximum(carry.metrics_count, 1)
+        avg_tm = jax.tree.map(lambda s: s / count, carry.train_metrics)
+
+        eval_lengths, eval_returns = eval_callback(carry, actor_opt, rngs)
+        metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(carry.global_step),
+            **avg_tm,
+        }
+
+        if log_fn is not None:
+            jax.debug.callback(log_fn, metrics)
+
+        # Reset accumulator (use traced ops to preserve nnx.scan carry references)
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda x: x * 0, carry.train_metrics),
+            metrics_count=carry.metrics_count * 0,
+        )
+
         return (carry, actor_opt, critic_opt, rngs), metrics
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
@@ -309,7 +378,7 @@ def train_ppo(
     if not config.skip_initial_evaluation:
         all_metrics = jax.tree.map(
             lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
-            initial_eval,
+            initial_metrics,
             all_metrics,
         )
 

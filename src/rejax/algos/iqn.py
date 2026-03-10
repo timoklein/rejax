@@ -6,6 +6,7 @@ Dimension key:
     K: num quantile samples (num_tau_samples or num_tau_prime_samples)
 """
 
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import chex
@@ -33,7 +34,10 @@ from rejax.buffers import Minibatch, ReplayBuffer
 from rejax.configs import IQNConfig
 from rejax.evaluate import evaluate
 from rejax.networks import ImplicitQuantileNetwork
-from rejax.types import EnvParams, EvalMetrics, GymnaxEnv, TrainState
+from rejax.types import EnvParams, GymnaxEnv, Metrics, TrainState
+
+
+_IQN_METRIC_NAMES = ("quantile_loss", "mean_q_value")
 
 
 class IQNCarry(NamedTuple):
@@ -46,6 +50,8 @@ class IQNCarry(NamedTuple):
     replay_buffer: ReplayBuffer
     obs_rms: RMSState
     rew_rms: RewardRMSState
+    train_metrics: dict
+    metrics_count: int
 
 
 def _create_networks(
@@ -77,7 +83,8 @@ def train_iqn(
     *,
     env: GymnaxEnv | None = None,
     env_params: EnvParams = None,
-) -> tuple[TrainState, EvalMetrics]:
+    log_fn: Callable[..., None] | None = None,
+) -> tuple[TrainState, Metrics]:
     """Train IQN. Designed to be JIT-able and vmap-able over rng."""
     env, env_params = create_env(config, env, env_params)
 
@@ -105,6 +112,8 @@ def train_iqn(
     rew_rms = RewardRMSState.create(num_envs)
     buf = ReplayBuffer.empty(config.buffer_size, obs_space, action_space)
 
+    zero_train_metrics = {k: jnp.float32(0.0) for k in _IQN_METRIC_NAMES}
+
     carry = IQNCarry(
         env_state=env_state,
         last_obs=obs,
@@ -113,6 +122,8 @@ def train_iqn(
         replay_buffer=buf,
         obs_rms=obs_rms,
         rew_rms=rew_rms,
+        train_metrics=zero_train_metrics,
+        metrics_count=0,
     )
 
     # --- Collect transitions ---
@@ -184,10 +195,12 @@ def train_iqn(
             # (B, K', K) — target quantiles x online quantiles
             td_BKK = jax.vmap(lambda x, y: x[None, :] - y[:, None])(target_BK, z_BK)
             loss = rho(td_BKK, tau_BK).sum(axis=1)
-            return loss.mean()
+            mean_q = z_BK.mean()
+            return loss.mean(), mean_q
 
-        _loss, grads = nnx.value_and_grad(loss_fn)(q_network)
+        (loss, mean_q), grads = nnx.value_and_grad(loss_fn, has_aux=True)(q_network)
         q_optimizer.update(grads)
+        return loss, mean_q
 
     # --- Train iteration ---
     def train_iteration(carry, q_optimizer, q_target, rngs):
@@ -199,26 +212,41 @@ def train_iqn(
         carry, batch = collect_transitions(carry, q_optimizer.model, epsilon, uniform, rngs)
         carry = carry._replace(replay_buffer=carry.replay_buffer.extend(batch))
 
+        zero_update_metrics = {"quantile_loss": jnp.float32(0.0), "mean_q_value": jnp.float32(0.0)}
+
         def update_iteration(_, state):
-            carry, q_opt, q_tgt, rngs = state
+            carry, q_opt, q_tgt, rngs, metrics_sum = state
             minibatch = carry.replay_buffer.sample(config.batch_size, rngs())
             minibatch = normalize_minibatch(minibatch, config, carry.obs_rms, carry.rew_rms)
-            update_q(minibatch, q_opt, q_tgt, rngs)
-            return (carry, q_opt, q_tgt, rngs)
+            quantile_loss, mean_q = update_q(minibatch, q_opt, q_tgt, rngs)
+            metrics_sum = jax.tree.map(
+                lambda s, m: s + m, metrics_sum, {"quantile_loss": quantile_loss, "mean_q_value": mean_q}
+            )
+            return (carry, q_opt, q_tgt, rngs, metrics_sum)
 
         def do_updates(carry, q_opt, q_tgt, rngs):
-            return nnx.fori_loop(0, config.num_epochs, update_iteration, (carry, q_opt, q_tgt, rngs))
+            carry, q_opt, q_tgt, rngs, metrics_sum = nnx.fori_loop(
+                0, config.num_epochs, update_iteration, (carry, q_opt, q_tgt, rngs, zero_update_metrics)
+            )
+            iter_metrics = jax.tree.map(lambda s: s / config.num_epochs, metrics_sum)
+            return carry, q_opt, q_tgt, rngs, iter_metrics
 
         def no_updates(carry, q_opt, q_tgt, rngs):
-            return (carry, q_opt, q_tgt, rngs)
+            return carry, q_opt, q_tgt, rngs, zero_update_metrics
 
-        carry, q_optimizer, q_target, rngs = nnx.cond(
+        carry, q_optimizer, q_target, rngs, update_metrics = nnx.cond(
             start_training, do_updates, no_updates, carry, q_optimizer, q_target, rngs
         )
 
         # Update target network
         q_target = maybe_update_targets(
             q_optimizer.model, q_target, config.polyak, config.target_update_freq, old_global_step, carry.global_step
+        )
+
+        # Accumulate metrics (only when training)
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda s, m: jnp.where(start_training, s + m, s), carry.train_metrics, update_metrics),
+            metrics_count=jnp.where(start_training, carry.metrics_count + 1, carry.metrics_count),
         )
 
         return carry, q_optimizer, q_target, rngs
@@ -233,7 +261,15 @@ def train_iqn(
     num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
 
     if not config.skip_initial_evaluation:
-        initial_eval = eval_callback(carry, q_optimizer, rngs)
+        eval_lengths, eval_returns = eval_callback(carry, q_optimizer, rngs)
+        initial_metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(0),
+            **{k: jnp.float32(0.0) for k in _IQN_METRIC_NAMES},
+        }
+        if log_fn is not None:
+            jax.debug.callback(log_fn, initial_metrics)
 
     def eval_iteration(state, _):
         carry, q_opt, q_tgt, rngs = state
@@ -242,7 +278,28 @@ def train_iqn(
             return train_iteration(*s)
 
         carry, q_opt, q_tgt, rngs = nnx.fori_loop(0, steps_per_iter, train_body, (carry, q_opt, q_tgt, rngs))
-        metrics = eval_callback(carry, q_opt, rngs)
+
+        # Average training metrics
+        count = jnp.maximum(carry.metrics_count, 1)
+        avg_tm = jax.tree.map(lambda s: s / count, carry.train_metrics)
+
+        eval_lengths, eval_returns = eval_callback(carry, q_opt, rngs)
+        metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(carry.global_step),
+            **avg_tm,
+        }
+
+        if log_fn is not None:
+            jax.debug.callback(log_fn, metrics)
+
+        # Reset accumulator (use traced ops to preserve nnx.scan carry references)
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda x: x * 0, carry.train_metrics),
+            metrics_count=carry.metrics_count * 0,
+        )
+
         return (carry, q_opt, q_tgt, rngs), metrics
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
@@ -254,7 +311,7 @@ def train_iqn(
     if not config.skip_initial_evaluation:
         all_metrics = jax.tree.map(
             lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
-            initial_eval,
+            initial_metrics,
             all_metrics,
         )
 

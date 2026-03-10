@@ -63,7 +63,7 @@ max-complexity = 15
 "__init__.py" = ["F401"]  # Allow unused imports in __init__.py
 "tests/**/*.py" = ["N802", "N803", "N806"]  # Allow non-lowercase names in tests
 "src/rejax/networks.py" = ["N806"]  # Shape suffixes use uppercase (e.g. obs_BD, action_BA)
-"src/rejax/algos/*.py" = ["N803", "N806"]  # Shape suffixes use uppercase (e.g. obs_BD, action_BA)
+"src/rejax/algos/*.py" = ["N803", "N806", "C901"]  # Shape suffixes; train functions are inherently complex
 
 [lint.isort]
 known-first-party = ["rejax"]

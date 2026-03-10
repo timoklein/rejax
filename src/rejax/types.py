@@ -9,7 +9,8 @@ import jax
 # Type aliases
 TrainState = dict[str, Any]
 EvalMetrics = tuple[jax.Array, jax.Array]  # (lengths, returns)
-TrainFn = Callable[..., tuple[TrainState, EvalMetrics]]
+Metrics = dict[str, jax.Array]
+TrainFn = Callable[..., tuple[TrainState, Metrics]]
 ActFn = Callable[[jax.Array, jax.Array], jax.Array]
 EnvParams = Any  # gymnax params have no common base
 

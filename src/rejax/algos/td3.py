@@ -6,6 +6,7 @@ Dimension key:
     C: num critics (2)
 """
 
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import chex
@@ -31,10 +32,12 @@ from rejax.buffers import Minibatch, ReplayBuffer
 from rejax.configs import TD3Config
 from rejax.evaluate import evaluate
 from rejax.networks import DeterministicPolicy, QNetwork
-from rejax.types import EnvParams, EvalMetrics, GymnaxEnv, TrainState
+from rejax.types import EnvParams, GymnaxEnv, Metrics, TrainState
 
 
 NUM_CRITICS = 2
+
+_TD3_METRIC_NAMES = ("actor_loss", "critic_loss", "mean_q_value")
 
 
 class TD3Carry(NamedTuple):
@@ -47,6 +50,8 @@ class TD3Carry(NamedTuple):
     replay_buffer: ReplayBuffer
     obs_rms: RMSState
     rew_rms: RewardRMSState
+    train_metrics: dict
+    metrics_count: int
 
 
 def _create_networks(
@@ -108,7 +113,8 @@ def train_td3(
     *,
     env: GymnaxEnv | None = None,
     env_params: EnvParams = None,
-) -> tuple[TrainState, EvalMetrics]:
+    log_fn: Callable[..., None] | None = None,
+) -> tuple[TrainState, Metrics]:
     """Train TD3. Designed to be JIT-able and vmap-able over rng.
 
     Args:
@@ -147,6 +153,8 @@ def train_td3(
     # Init replay buffer
     buf = ReplayBuffer.empty(config.buffer_size, obs_space, action_space)
 
+    zero_train_metrics = {k: jnp.float32(0.0) for k in _TD3_METRIC_NAMES}
+
     carry = TD3Carry(
         env_state=env_state,
         last_obs=obs,
@@ -155,6 +163,8 @@ def train_td3(
         replay_buffer=buf,
         obs_rms=obs_rms,
         rew_rms=rew_rms,
+        train_metrics=zero_train_metrics,
+        metrics_count=0,
     )
 
     # --- Collect transitions ---
@@ -208,6 +218,10 @@ def train_td3(
         q_target_B = jnp.min(qs_target_CB, axis=0)
         target_B = mb.reward + (1 - mb.done) * config.gamma * q_target_B
 
+        # Mean Q-value for logging (before updates)
+        mean_q = critic_opts[0].model(mb.obs, mb.action).mean()
+
+        total_critic_loss = jnp.float32(0.0)
         for critic_opt in critic_opts:
             critic = critic_opt.model
 
@@ -215,8 +229,10 @@ def train_td3(
                 q_B = critic_model(mb.obs, mb.action)
                 return optax.l2_loss(q_B, target_B).mean()
 
-            _loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
+            loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
             critic_opt.update(grads)
+            total_critic_loss = total_critic_loss + loss
+        return total_critic_loss / NUM_CRITICS, mean_q
 
     # --- Update actor ---
     def update_actor(mb, actor_optimizer, critic_opts):
@@ -228,8 +244,9 @@ def train_td3(
             q_B = critics[0](mb.obs, action_BA)
             return -q_B.mean()
 
-        _loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
+        loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
         actor_optimizer.update(grads)
+        return loss
 
     # --- Train critic phase (called policy_delay times) ---
     def train_critic_phase(carry, actor_model, actor_target, critic_opts, critic_targets, placeholder_mb, rngs):
@@ -240,25 +257,32 @@ def train_td3(
         carry, transitions = collect_transitions(carry, actor_model, uniform, rngs)
         carry = carry._replace(replay_buffer=carry.replay_buffer.extend(transitions))
 
+        zero_critic_metrics = {"critic_loss": jnp.float32(0.0), "mean_q_value": jnp.float32(0.0)}
+
         # actor_target is read-only in update_critics
         def update_body(i, state):
-            carry, c_opts, c_tgts, minibatches, rngs = state
+            carry, c_opts, c_tgts, minibatches, rngs, metrics_sum = state
             minibatch = carry.replay_buffer.sample(config.batch_size, rngs())
             minibatch = normalize_minibatch(minibatch, config, carry.obs_rms, carry.rew_rms)
-            update_critics(minibatch, actor_target, c_opts, c_tgts, rngs)
+            critic_loss, mean_q = update_critics(minibatch, actor_target, c_opts, c_tgts, rngs)
             minibatches = jax.tree.map(lambda mb_all, m: mb_all.at[i].set(m), minibatches, minibatch)
-            return (carry, c_opts, c_tgts, minibatches, rngs)
+            metrics_sum = jax.tree.map(lambda s, m: s + m, metrics_sum, {"critic_loss": critic_loss, "mean_q_value": mean_q})
+            return (carry, c_opts, c_tgts, minibatches, rngs, metrics_sum)
 
         def do_updates(carry, c_opts, c_tgts, rngs):
-            return nnx.fori_loop(0, config.num_epochs, update_body, (carry, c_opts, c_tgts, placeholder_mb, rngs))
+            carry, c_opts, c_tgts, mbs, rngs, metrics_sum = nnx.fori_loop(
+                0, config.num_epochs, update_body, (carry, c_opts, c_tgts, placeholder_mb, rngs, zero_critic_metrics)
+            )
+            critic_metrics = jax.tree.map(lambda s: s / config.num_epochs, metrics_sum)
+            return carry, c_opts, c_tgts, mbs, rngs, critic_metrics
 
         def no_updates(carry, c_opts, c_tgts, rngs):
-            return (carry, c_opts, c_tgts, placeholder_mb, rngs)
+            return carry, c_opts, c_tgts, placeholder_mb, rngs, zero_critic_metrics
 
-        carry, critic_opts, critic_targets, minibatches, rngs = nnx.cond(
+        carry, critic_opts, critic_targets, minibatches, rngs, critic_metrics = nnx.cond(
             start_training, do_updates, no_updates, carry, critic_opts, critic_targets, rngs
         )
-        return carry, critic_opts, critic_targets, minibatches, rngs
+        return carry, critic_opts, critic_targets, minibatches, rngs, critic_metrics
 
     # --- Train iteration ---
     def train_iteration(carry, actor_optimizer, actor_target, critic_opts, critic_targets, rngs):
@@ -270,33 +294,41 @@ def train_td3(
             carry.replay_buffer.sample(config.batch_size, jax.random.PRNGKey(0)),
         )
 
+        zero_critic_metrics = {"critic_loss": jnp.float32(0.0), "mean_q_value": jnp.float32(0.0)}
+
         # actor_optimizer.model and actor_target are read-only inside critic phase
         def policy_delay_body(_, state):
-            carry, minibatches, c_opts, c_tgts, rngs = state
-            carry, c_opts, c_tgts, minibatches, rngs = train_critic_phase(
+            carry, minibatches, c_opts, c_tgts, rngs, critic_metrics_sum = state
+            carry, c_opts, c_tgts, minibatches, rngs, phase_critic_metrics = train_critic_phase(
                 carry, actor_optimizer.model, actor_target, c_opts, c_tgts, placeholder_mb, rngs
             )
-            return (carry, minibatches, c_opts, c_tgts, rngs)
+            critic_metrics_sum = jax.tree.map(lambda s, m: s + m, critic_metrics_sum, phase_critic_metrics)
+            return (carry, minibatches, c_opts, c_tgts, rngs, critic_metrics_sum)
 
-        carry, minibatches, critic_opts, critic_targets, rngs = nnx.fori_loop(
-            0, config.policy_delay, policy_delay_body, (carry, placeholder_mb, critic_opts, critic_targets, rngs)
+        carry, minibatches, critic_opts, critic_targets, rngs, critic_metrics_sum = nnx.fori_loop(
+            0,
+            config.policy_delay,
+            policy_delay_body,
+            (carry, placeholder_mb, critic_opts, critic_targets, rngs, zero_critic_metrics),
         )
+        critic_metrics = jax.tree.map(lambda s: s / config.policy_delay, critic_metrics_sum)
 
         # Update actor using stored minibatches
         start_training = carry.global_step > config.fill_buffer
 
         def do_actor_updates(actor_opt):
-            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
             def scan_update(actor_opt, mb):
-                update_actor(mb, actor_opt, critic_opts)
-                return actor_opt
+                actor_loss = update_actor(mb, actor_opt, critic_opts)
+                return actor_opt, actor_loss
 
-            return scan_update(actor_opt, minibatches)
+            actor_opt, actor_losses = scan_update(actor_opt, minibatches)
+            return actor_opt, actor_losses.mean()
 
         def no_actor_updates(actor_opt):
-            return actor_opt
+            return actor_opt, jnp.float32(0.0)
 
-        actor_optimizer = nnx.cond(start_training, do_actor_updates, no_actor_updates, actor_optimizer)
+        actor_optimizer, actor_loss = nnx.cond(start_training, do_actor_updates, no_actor_updates, actor_optimizer)
 
         # Update target networks
         online_models = [actor_optimizer.model] + [opt.model for opt in critic_opts]
@@ -306,6 +338,13 @@ def train_td3(
         )
         actor_target = updated_targets[0]  # type: ignore[assignment]
         critic_targets = updated_targets[1:]  # type: ignore[assignment]
+
+        # Accumulate metrics (only when training)
+        iter_metrics = {"actor_loss": actor_loss, **critic_metrics}
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda s, m: jnp.where(start_training, s + m, s), carry.train_metrics, iter_metrics),
+            metrics_count=jnp.where(start_training, carry.metrics_count + 1, carry.metrics_count),
+        )
 
         return carry, actor_optimizer, actor_target, critic_opts, critic_targets, rngs
 
@@ -320,7 +359,15 @@ def train_td3(
     num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
 
     if not config.skip_initial_evaluation:
-        initial_eval = eval_callback(carry, actor_optimizer, rngs)
+        eval_lengths, eval_returns = eval_callback(carry, actor_optimizer, rngs)
+        initial_metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(0),
+            **{k: jnp.float32(0.0) for k in _TD3_METRIC_NAMES},
+        }
+        if log_fn is not None:
+            jax.debug.callback(log_fn, initial_metrics)
 
     def eval_iteration(state, _):
         carry, actor_opt, actor_tgt, c_opts, c_tgts, rngs = state
@@ -331,7 +378,28 @@ def train_td3(
         carry, actor_opt, actor_tgt, c_opts, c_tgts, rngs = nnx.fori_loop(
             0, num_train_its_per_eval, train_body, (carry, actor_opt, actor_tgt, c_opts, c_tgts, rngs)
         )
-        metrics = eval_callback(carry, actor_opt, rngs)
+
+        # Average training metrics
+        count = jnp.maximum(carry.metrics_count, 1)
+        avg_tm = jax.tree.map(lambda s: s / count, carry.train_metrics)
+
+        eval_lengths, eval_returns = eval_callback(carry, actor_opt, rngs)
+        metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(carry.global_step),
+            **avg_tm,
+        }
+
+        if log_fn is not None:
+            jax.debug.callback(log_fn, metrics)
+
+        # Reset accumulator (use traced ops to preserve nnx.scan carry references)
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda x: x * 0, carry.train_metrics),
+            metrics_count=carry.metrics_count * 0,
+        )
+
         return (carry, actor_opt, actor_tgt, c_opts, c_tgts, rngs), metrics
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
@@ -345,7 +413,7 @@ def train_td3(
     if not config.skip_initial_evaluation:
         all_metrics = jax.tree.map(
             lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
-            initial_eval,
+            initial_metrics,
             all_metrics,
         )
 

@@ -6,6 +6,7 @@ Dimension key:
     C: num critics (2)
 """
 
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import chex
@@ -31,10 +32,12 @@ from rejax.buffers import Minibatch, ReplayBuffer
 from rejax.configs import SACConfig
 from rejax.evaluate import evaluate
 from rejax.networks import QNetwork, SquashedGaussianPolicy
-from rejax.types import EnvParams, EvalMetrics, GymnaxEnv, TrainState
+from rejax.types import EnvParams, GymnaxEnv, Metrics, TrainState
 
 
 NUM_CRITICS = 2
+
+_SAC_METRIC_NAMES = ("actor_loss", "critic_loss", "alpha", "entropy")
 
 
 class SACCarry(NamedTuple):
@@ -49,6 +52,8 @@ class SACCarry(NamedTuple):
     rew_rms: RewardRMSState
     log_alpha: chex.Array
     alpha_opt_state: Any
+    train_metrics: dict
+    metrics_count: int
 
 
 def _create_networks(
@@ -107,7 +112,8 @@ def train_sac(
     *,
     env: GymnaxEnv | None = None,
     env_params: EnvParams = None,
-) -> tuple[TrainState, EvalMetrics]:
+    log_fn: Callable[..., None] | None = None,
+) -> tuple[TrainState, Metrics]:
     """Train SAC. Designed to be JIT-able and vmap-able over rng.
 
     Args:
@@ -155,6 +161,8 @@ def train_sac(
     # Init replay buffer
     buf = ReplayBuffer.empty(config.buffer_size, obs_space, action_space)
 
+    zero_train_metrics = {k: jnp.float32(0.0) for k in _SAC_METRIC_NAMES}
+
     carry = SACCarry(
         env_state=env_state,
         last_obs=obs,
@@ -165,6 +173,8 @@ def train_sac(
         rew_rms=rew_rms,
         log_alpha=log_alpha,
         alpha_opt_state=alpha_opt_state,
+        train_metrics=zero_train_metrics,
+        metrics_count=0,
     )
 
     # --- Collect transitions ---
@@ -208,9 +218,10 @@ def train_sac(
             loss = (alpha * log_prob_B - q_min_B).mean()
             return loss, log_prob_B
 
-        (_loss, log_prob_B), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(actor_optimizer.model)
+        (actor_loss, log_prob_B), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(actor_optimizer.model)
         actor_optimizer.update(grads)
-        return log_prob_B
+        entropy = -log_prob_B.mean()
+        return log_prob_B, actor_loss, entropy
 
     # --- Update critics ---
     def update_critics(carry, mb, actor, critic_opts, critic_targets, rngs):
@@ -223,6 +234,7 @@ def train_sac(
         q_target_B = q_target_B - alpha * next_log_prob_B
         target_B = mb.reward + (1 - mb.done) * config.gamma * q_target_B
 
+        total_critic_loss = jnp.float32(0.0)
         for critic_opt in critic_opts:
             critic = critic_opt.model
 
@@ -230,8 +242,10 @@ def train_sac(
                 q_B = critic_model(mb.obs, mb.action)
                 return optax.l2_loss(q_B, target_B).mean()
 
-            _loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
+            loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
             critic_opt.update(grads)
+            total_critic_loss = total_critic_loss + loss
+        return total_critic_loss / NUM_CRITICS
 
     # --- Update alpha ---
     def update_alpha(carry, logprob):
@@ -253,23 +267,35 @@ def train_sac(
         carry, batch = collect_transitions(carry, actor_optimizer.model, rngs)
         carry = carry._replace(replay_buffer=carry.replay_buffer.extend(batch))
 
+        zero_update_metrics = {
+            "actor_loss": jnp.float32(0.0),
+            "critic_loss": jnp.float32(0.0),
+            "entropy": jnp.float32(0.0),
+        }
+
         def update_iteration(_, state):
-            carry, actor_opt, c_opts, c_tgts, rngs = state
+            carry, actor_opt, c_opts, c_tgts, rngs, metrics_sum = state
             minibatch = carry.replay_buffer.sample(config.batch_size, rngs())
             minibatch = normalize_minibatch(minibatch, config, carry.obs_rms, carry.rew_rms)
 
-            logprob = update_actor(carry, minibatch, actor_opt, c_opts, rngs)
-            update_critics(carry, minibatch, actor_opt.model, c_opts, c_tgts, rngs)
+            logprob, actor_loss, entropy = update_actor(carry, minibatch, actor_opt, c_opts, rngs)
+            critic_loss = update_critics(carry, minibatch, actor_opt.model, c_opts, c_tgts, rngs)
             carry = update_alpha(carry, logprob)
-            return (carry, actor_opt, c_opts, c_tgts, rngs)
+            step_metrics = {"actor_loss": actor_loss, "critic_loss": critic_loss, "entropy": entropy}
+            metrics_sum = jax.tree.map(lambda s, m: s + m, metrics_sum, step_metrics)
+            return (carry, actor_opt, c_opts, c_tgts, rngs, metrics_sum)
 
         def do_updates(carry, actor_opt, c_opts, c_tgts, rngs):
-            return nnx.fori_loop(0, config.num_epochs, update_iteration, (carry, actor_opt, c_opts, c_tgts, rngs))
+            carry, actor_opt, c_opts, c_tgts, rngs, metrics_sum = nnx.fori_loop(
+                0, config.num_epochs, update_iteration, (carry, actor_opt, c_opts, c_tgts, rngs, zero_update_metrics)
+            )
+            iter_metrics = jax.tree.map(lambda s: s / config.num_epochs, metrics_sum)
+            return carry, actor_opt, c_opts, c_tgts, rngs, iter_metrics
 
         def no_updates(carry, actor_opt, c_opts, c_tgts, rngs):
-            return (carry, actor_opt, c_opts, c_tgts, rngs)
+            return carry, actor_opt, c_opts, c_tgts, rngs, zero_update_metrics
 
-        carry, actor_optimizer, critic_opts, critic_targets, rngs = nnx.cond(
+        carry, actor_optimizer, critic_opts, critic_targets, rngs, update_metrics = nnx.cond(
             start_training, do_updates, no_updates, carry, actor_optimizer, critic_opts, critic_targets, rngs
         )
 
@@ -277,6 +303,13 @@ def train_sac(
         online_critics = [opt.model for opt in critic_opts]
         critic_targets = maybe_update_targets(
             online_critics, critic_targets, config.polyak, config.target_update_freq, old_global_step, carry.global_step
+        )
+
+        # Accumulate metrics (only when training)
+        iter_metrics = {**update_metrics, "alpha": jnp.exp(carry.log_alpha)}
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda s, m: jnp.where(start_training, s + m, s), carry.train_metrics, iter_metrics),
+            metrics_count=jnp.where(start_training, carry.metrics_count + 1, carry.metrics_count),
         )
 
         return carry, actor_optimizer, critic_opts, critic_targets, rngs
@@ -291,7 +324,15 @@ def train_sac(
     num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
 
     if not config.skip_initial_evaluation:
-        initial_eval = eval_callback(carry, actor_optimizer, rngs)
+        eval_lengths, eval_returns = eval_callback(carry, actor_optimizer, rngs)
+        initial_metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(0),
+            **{k: jnp.float32(0.0) for k in _SAC_METRIC_NAMES},
+        }
+        if log_fn is not None:
+            jax.debug.callback(log_fn, initial_metrics)
 
     def eval_iteration(state, _):
         carry, actor_opt, c_opts, c_tgts, rngs = state
@@ -302,7 +343,28 @@ def train_sac(
         carry, actor_opt, c_opts, c_tgts, rngs = nnx.fori_loop(
             0, steps_per_iter, train_body, (carry, actor_opt, c_opts, c_tgts, rngs)
         )
-        metrics = eval_callback(carry, actor_opt, rngs)
+
+        # Average training metrics
+        count = jnp.maximum(carry.metrics_count, 1)
+        avg_tm = jax.tree.map(lambda s: s / count, carry.train_metrics)
+
+        eval_lengths, eval_returns = eval_callback(carry, actor_opt, rngs)
+        metrics = {
+            "eval_lengths": eval_lengths,
+            "eval_returns": eval_returns,
+            "global_step": jnp.int32(carry.global_step),
+            **avg_tm,
+        }
+
+        if log_fn is not None:
+            jax.debug.callback(log_fn, metrics)
+
+        # Reset accumulator (use traced ops to preserve nnx.scan carry references)
+        carry = carry._replace(
+            train_metrics=jax.tree.map(lambda x: x * 0, carry.train_metrics),
+            metrics_count=carry.metrics_count * 0,
+        )
+
         return (carry, actor_opt, c_opts, c_tgts, rngs), metrics
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
@@ -316,7 +378,7 @@ def train_sac(
     if not config.skip_initial_evaluation:
         all_metrics = jax.tree.map(
             lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
-            initial_eval,
+            initial_metrics,
             all_metrics,
         )
 
