@@ -1,7 +1,6 @@
-"""Proximal Policy Optimization (PPO)."""
+"""Proximal Policy Optimization (PPO) — standalone training function."""
 
-from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import chex
 import gymnax
@@ -9,15 +8,19 @@ import jax
 import numpy as np
 import optax
 from flax import nnx, struct
-from gymnax.environments.environment import Environment
 from jax import numpy as jnp
 
-from rejax.algos.algorithm import Algorithm, register_init
-from rejax.algos.mixins import (
-    NormalizeObservationsMixin,
-    NormalizeRewardsMixin,
-    OnPolicyMixin,
+from rejax.algos.utils import (
+    FloatObsWrapper,
+    RewardRMSState,
+    RMSState,
+    normalize_obs,
+    shuffle_and_split,
+    update_and_normalize_obs,
+    update_and_normalize_rew,
 )
+from rejax.compat import create
+from rejax.evaluate import evaluate
 from rejax.networks import DiscretePolicy, GaussianPolicy, VNetwork
 
 
@@ -40,263 +43,186 @@ class AdvantageMinibatch(struct.PyTreeNode):
     targets: chex.Array
 
 
-class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algorithm):
-    """Proximal Policy Optimization algorithm.
+class PPOCarry(NamedTuple):
+    """Non-module carry state for PPO training."""
 
-    PPO is an on-policy algorithm that uses clipped surrogate objectives
-    for policy updates and optional value function clipping.
-    """
+    rng: chex.PRNGKey
+    env_state: Any
+    last_obs: chex.Array
+    last_done: chex.Array
+    global_step: int
+    obs_rms: RMSState
+    rew_rms: RewardRMSState
 
-    # Network module types (stored as fields for type info, not pytree nodes)
-    actor_cls: type[nnx.Module] = struct.field(pytree_node=False, default=None)
-    critic_cls: type[nnx.Module] = struct.field(pytree_node=False, default=None)
 
-    # Network creation kwargs
-    actor_kwargs: dict = struct.field(pytree_node=False, default=None)
-    critic_kwargs: dict = struct.field(pytree_node=False, default=None)
+def _create_env(config):
+    if isinstance(config.env, str):
+        env, env_params = create(config.env)
+    else:
+        env = config.env
+        env_params = getattr(config, "env_params", None) or env.default_params
+    if config.normalize_observations:
+        env = FloatObsWrapper(env)
+    return env, env_params
 
-    # PPO hyperparameters
-    num_epochs: int = struct.field(pytree_node=False, default=8)
-    gae_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.95)
-    clip_eps: chex.Scalar = struct.field(pytree_node=True, default=0.2)
-    vf_coef: chex.Scalar = struct.field(pytree_node=True, default=0.5)
-    ent_coef: chex.Scalar = struct.field(pytree_node=True, default=0.01)
 
-    def make_act(self, ts: Any) -> Callable:
-        """Create an action selection function for evaluation.
+def _create_networks(config, env, env_params, rng):
+    agent_kwargs = {}
+    if hasattr(config, "agent_kwargs") and config.agent_kwargs is not None:
+        import dataclasses
 
-        Args:
-            ts: Training state containing network states
+        agent_kwargs = dataclasses.asdict(config.agent_kwargs)
 
-        Returns:
-            Function that takes (obs, rng) and returns an action
-        """
-        # Reconstruct optimizer and extract actor network
-        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
-        actor = actor_optimizer.model
+    activation = agent_kwargs.pop("activation", "swish")
+    agent_kwargs["activation"] = getattr(nnx, activation)
+    hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
+    agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
 
-        def act(obs: jax.Array, rng: chex.PRNGKey) -> jax.Array:
-            if getattr(self, "normalize_observations", False):
-                obs = self.normalize_obs(ts.obs_rms_state, obs)
+    action_space = env.action_space(env_params)
+    obs_space = env.observation_space(env_params)
+    in_features = int(np.prod(obs_space.shape))
+    discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
 
-            obs = jnp.expand_dims(obs, 0)
-            action = actor.act(obs, rng)
-            return jnp.squeeze(action)
-
-        return act
-
-    @classmethod
-    def create_agent(cls, config: dict, env: Environment, env_params: Any) -> dict:
-        """Create actor and critic network configurations.
-
-        Args:
-            config: Configuration dictionary, modified in-place
-            env: Environment instance
-            env_params: Environment parameters
-
-        Returns:
-            Dictionary with network class types and kwargs
-        """
-        action_space = env.action_space(env_params)
-        obs_space = env.observation_space(env_params)
-        discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
-
-        agent_kwargs = config.pop("agent_kwargs", {})
-        activation = agent_kwargs.pop("activation", "swish")
-        agent_kwargs["activation"] = getattr(nnx, activation)
-
-        hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
-        agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
-
-        # Get observation dimension
-        obs_shape = obs_space.shape
-        in_features = int(np.prod(obs_shape))
-
-        # Determine actor class and kwargs
-        if discrete:
-            actor_cls = DiscretePolicy
-            actor_kwargs = {
-                "in_features": in_features,
-                "action_dim": action_space.n,
-                **agent_kwargs,
-            }
-        else:
-            actor_cls = GaussianPolicy
-            actor_kwargs = {
-                "in_features": in_features,
-                "action_dim": int(np.prod(action_space.shape)),
-                "action_range": (float(action_space.low), float(action_space.high)),
-                **agent_kwargs,
-            }
-
-        # Critic kwargs
-        critic_cls = VNetwork
-        critic_kwargs = {"in_features": in_features, **agent_kwargs}
-
-        return {
-            "actor_cls": actor_cls,
-            "actor_kwargs": actor_kwargs,
-            "critic_cls": critic_cls,
-            "critic_kwargs": critic_kwargs,
+    if discrete:
+        actor_cls = DiscretePolicy
+        actor_kwargs = {
+            "in_features": in_features,
+            "action_dim": action_space.n,
+            **agent_kwargs,
+        }
+    else:
+        actor_cls = GaussianPolicy
+        actor_kwargs = {
+            "in_features": in_features,
+            "action_dim": int(np.prod(action_space.shape)),
+            "action_range": (float(action_space.low), float(action_space.high)),
+            **agent_kwargs,
         }
 
-    @register_init
-    def initialize_network_params(self, rng: chex.PRNGKey) -> dict:
-        """Initialize actor and critic networks with optimizers.
+    critic_kwargs = {"in_features": in_features, **agent_kwargs}
 
-        Args:
-            rng: RNG key for network initialization
+    rng, rng_actor, rng_critic = jax.random.split(rng, 3)
+    actor = actor_cls(**actor_kwargs, rngs=nnx.Rngs(rng_actor))
+    critic = VNetwork(**critic_kwargs, rngs=nnx.Rngs(rng_critic))
 
-        Returns:
-            Dictionary with network graphdefs, states, and optimizers
-        """
-        rng, rng_actor, rng_critic = jax.random.split(rng, 3)
+    tx = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adam(learning_rate=config.learning_rate),
+    )
+    actor_optimizer = nnx.Optimizer(actor, tx)
+    critic_optimizer = nnx.Optimizer(critic, tx)
+    return actor_optimizer, critic_optimizer
 
-        # Create networks
-        actor = self.actor_cls(**self.actor_kwargs, rngs=nnx.Rngs(rng_actor))
-        critic = self.critic_cls(**self.critic_kwargs, rngs=nnx.Rngs(rng_critic))
 
-        # Create optimizer
-        tx = optax.chain(
-            optax.clip_by_global_norm(self.max_grad_norm),
-            optax.adam(learning_rate=self.learning_rate),
-        )
+def _make_act(actor, config, obs_rms=None):
+    """Build eval policy closure."""
 
-        # Create optimizers
-        actor_optimizer = nnx.Optimizer(actor, tx)
-        critic_optimizer = nnx.Optimizer(critic, tx)
+    def act(obs, rng):
+        if config.normalize_observations and obs_rms is not None:
+            obs = normalize_obs(obs_rms, obs)
+        obs = jnp.expand_dims(obs, 0)
+        action = actor.act(obs, rng)
+        return jnp.squeeze(action)
 
-        # Split into graphdef and state for JAX transforms
-        actor_graphdef, actor_state = nnx.split(actor_optimizer)
-        critic_graphdef, critic_state = nnx.split(critic_optimizer)
+    return act
 
-        return {
-            "actor_graphdef": actor_graphdef,
-            "actor_state": actor_state,
-            "critic_graphdef": critic_graphdef,
-            "critic_state": critic_state,
-        }
 
-    def train_iteration(self, ts: Any) -> Any:
-        """Run one training iteration (collect trajectories + multiple epochs of updates).
+def train_ppo(config, rng, *, env=None, env_params=None):
+    """Train PPO. Designed to be JIT-able and vmap-able over rng."""
+    if env is None:
+        env, env_params = _create_env(config)
+    else:
+        if env_params is None:
+            env_params = env.default_params
+        if config.normalize_observations:
+            env = FloatObsWrapper(env)
 
-        Args:
-            ts: Training state
+    num_envs = config.num_envs
+    num_steps = config.num_steps
+    action_space = env.action_space(env_params)
+    obs_space = env.observation_space(env_params)
+    max_steps = env_params.max_steps_in_episode
+    discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
 
-        Returns:
-            Updated training state
-        """
-        # Merge once at top
-        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
-        critic_optimizer = nnx.merge(ts.critic_graphdef, ts.critic_state)
-        actor = actor_optimizer.model
-        critic = critic_optimizer.model
+    iteration_size = num_envs * num_steps
+    assert iteration_size % config.num_minibatches == 0
 
-        ts, trajectories = self.collect_trajectories(ts, actor, critic)
+    vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
+    vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
-        last_val = critic(ts.last_obs)
-        last_val = jnp.where(ts.last_done, 0, last_val)
-        advantages, targets = self.calculate_gae(trajectories, last_val)
+    # Action clipping bounds for continuous envs
+    if not discrete:
+        action_low = action_space.low
+        action_high = action_space.high
 
-        def update_epoch(_, state):
-            ts, actor_opt, critic_opt = state
-            rng, minibatch_rng = jax.random.split(ts.rng)
-            ts = ts.replace(rng=rng)
-            batch = AdvantageMinibatch(trajectories, advantages, targets)
-            minibatches = self.shuffle_and_split(batch, minibatch_rng)
+    # Create networks
+    rng, rng_net = jax.random.split(rng)
+    actor_optimizer, critic_optimizer = _create_networks(config, env, env_params, rng_net)
 
-            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
-            def update_step(carry, mb):
-                ts, actor_opt, critic_opt = carry
-                self.update(mb, actor_opt, critic_opt)
-                return (ts, actor_opt, critic_opt)
+    # Init env
+    rng, rng_env = jax.random.split(rng)
+    obs, env_state = vmap_reset(jax.random.split(rng_env, num_envs), env_params)
 
-            ts, actor_opt, critic_opt = update_step((ts, actor_opt, critic_opt), minibatches)
-            return (ts, actor_opt, critic_opt)
+    # Init normalization
+    obs_rms = RMSState.create(obs_space.shape)
+    rew_rms = RewardRMSState.create(num_envs)
 
-        ts, actor_optimizer, critic_optimizer = nnx.fori_loop(
-            0, self.num_epochs, update_epoch, (ts, actor_optimizer, critic_optimizer)
-        )
+    carry = PPOCarry(
+        rng=rng,
+        env_state=env_state,
+        last_obs=obs,
+        last_done=jnp.zeros(num_envs, dtype=bool),
+        global_step=0,
+        obs_rms=obs_rms,
+        rew_rms=rew_rms,
+    )
 
-        # Split once at bottom
-        _, actor_state = nnx.split(actor_optimizer)
-        _, critic_state = nnx.split(critic_optimizer)
-        return ts.replace(actor_state=actor_state, critic_state=critic_state)
+    # --- Collect trajectories ---
+    def collect_trajectories(carry, actor, critic):
+        """Roll out policy for num_steps. Actor/critic are read-only."""
 
-    def collect_trajectories(self, ts: Any, actor: nnx.Module, critic: nnx.Module) -> tuple[Any, Trajectory]:
-        """Collect trajectories by rolling out the current policy.
-
-        Args:
-            ts: Training state
-            actor: Live actor network module
-            critic: Live critic network module
-
-        Returns:
-            Tuple of (updated_ts, trajectories)
-        """
-
-        def env_step(ts: Any, unused: None) -> tuple:
-            # Get keys for sampling action and stepping environment
-            rng, new_rng = jax.random.split(ts.rng)
-            ts = ts.replace(rng=rng)
+        def env_step(carry, _):
+            rng, new_rng = jax.random.split(carry.rng)
+            carry = carry._replace(rng=rng)
             rng_steps, rng_action = jax.random.split(new_rng, 2)
-            rng_steps = jax.random.split(rng_steps, self.num_envs)
+            rng_steps = jax.random.split(rng_steps, num_envs)
 
             # Sample action
-            unclipped_action, log_prob = actor.action_log_prob(ts.last_obs, rng_action)
-            value = critic(ts.last_obs)
+            unclipped_action, log_prob = actor.action_log_prob(carry.last_obs, rng_action)
+            value = critic(carry.last_obs)
 
-            # Clip action
-            if self.discrete:
-                action = unclipped_action
-            else:
-                low = self.env.action_space(self.env_params).low
-                high = self.env.action_space(self.env_params).high
-                action = jnp.clip(unclipped_action, low, high)
+            action = unclipped_action if discrete else jnp.clip(unclipped_action, action_low, action_high)
 
             # Step environment
-            t = self.vmap_step(rng_steps, ts.env_state, action, self.env_params)
-            next_obs, env_state, reward, done, _ = t
+            next_obs, new_env_state, reward, done, _ = vmap_step(rng_steps, carry.env_state, action, env_params)
 
-            if self.normalize_observations:
-                obs_rms_state, next_obs = self.update_and_normalize_obs(ts.obs_rms_state, next_obs)
-                ts = ts.replace(obs_rms_state=obs_rms_state)
-            if self.normalize_rewards:
-                rew_rms_state, reward = self.update_and_normalize_rew(ts.rew_rms_state, reward, done)
-                ts = ts.replace(rew_rms_state=rew_rms_state)
+            obs_rms = carry.obs_rms
+            rew_rms = carry.rew_rms
+            if config.normalize_observations:
+                obs_rms, next_obs = update_and_normalize_obs(obs_rms, next_obs)
+            if config.normalize_rewards:
+                rew_rms, reward = update_and_normalize_rew(rew_rms, reward, done, config.gamma)
 
-            # Return updated runner state and transition
-            transition = Trajectory(ts.last_obs, unclipped_action, log_prob, reward, value, done)
-            ts = ts.replace(
-                env_state=env_state,
+            transition = Trajectory(carry.last_obs, unclipped_action, log_prob, reward, value, done)
+            carry = carry._replace(
+                env_state=new_env_state,
                 last_obs=next_obs,
                 last_done=done,
-                global_step=ts.global_step + self.num_envs,
+                global_step=carry.global_step + num_envs,
+                obs_rms=obs_rms,
+                rew_rms=rew_rms,
             )
-            return ts, transition
+            return carry, transition
 
-        ts, trajectories = jax.lax.scan(env_step, ts, None, self.num_steps)
-        return ts, trajectories
+        carry, trajectories = jax.lax.scan(env_step, carry, None, num_steps)
+        return carry, trajectories
 
-    def calculate_gae(self, trajectories: Trajectory, last_val: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Calculate Generalized Advantage Estimation (GAE).
-
-        Args:
-            trajectories: Collected trajectory data
-            last_val: Value estimate for the final state
-
-        Returns:
-            Tuple of (advantages, targets)
-        """
-
-        def get_advantages(advantage_and_next_value: tuple, transition: Trajectory) -> tuple:
+    # --- Calculate GAE ---
+    def calculate_gae(trajectories, last_val):
+        def get_advantages(advantage_and_next_value, transition):
             advantage, next_value = advantage_and_next_value
-            delta = (
-                transition.reward.squeeze()  # For gymnax envs that return shape (1, )
-                + self.gamma * next_value * (1 - transition.done)
-                - transition.value
-            )
-            advantage = delta + self.gamma * self.gae_lambda * (1 - transition.done) * advantage
+            delta = transition.reward.squeeze() + config.gamma * next_value * (1 - transition.done) - transition.value
+            advantage = delta + config.gamma * config.gae_lambda * (1 - transition.done) * advantage
             return (advantage, transition.value), advantage
 
         _, advantages = jax.lax.scan(
@@ -307,43 +233,117 @@ class PPO(OnPolicyMixin, NormalizeObservationsMixin, NormalizeRewardsMixin, Algo
         )
         return advantages, advantages + trajectories.value
 
-    def update_actor(self, batch: AdvantageMinibatch, actor_optimizer: nnx.Optimizer) -> None:
-        """Update actor network using PPO clipped objective. Mutates actor_optimizer in-place."""
+    # --- Update actor ---
+    def update_actor(batch, actor_optimizer):
         actor = actor_optimizer.model
 
-        def actor_loss_fn(model: nnx.Module) -> jax.Array:
+        def actor_loss_fn(model):
             log_prob, entropy = model.log_prob_entropy(batch.trajectories.obs, batch.trajectories.action)
             entropy = entropy.mean()
-
             ratio = jnp.exp(log_prob - batch.trajectories.log_prob)
             advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
-            clipped_ratio = jnp.clip(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
+            clipped_ratio = jnp.clip(ratio, 1 - config.clip_eps, 1 + config.clip_eps)
             pi_loss1 = ratio * advantages
             pi_loss2 = clipped_ratio * advantages
             pi_loss = -jnp.minimum(pi_loss1, pi_loss2).mean()
-            return pi_loss - self.ent_coef * entropy
+            return pi_loss - config.ent_coef * entropy
 
-        loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
+        _loss, grads = nnx.value_and_grad(actor_loss_fn)(actor)
         actor_optimizer.update(grads)
 
-    def update_critic(self, batch: AdvantageMinibatch, critic_optimizer: nnx.Optimizer) -> None:
-        """Update critic network using clipped value loss. Mutates critic_optimizer in-place."""
+    # --- Update critic ---
+    def update_critic(batch, critic_optimizer):
         critic = critic_optimizer.model
 
-        def critic_loss_fn(model: nnx.Module) -> jax.Array:
+        def critic_loss_fn(model):
             value = model(batch.trajectories.obs)
             value_pred_clipped = batch.trajectories.value + (value - batch.trajectories.value).clip(
-                -self.clip_eps, self.clip_eps
+                -config.clip_eps, config.clip_eps
             )
             value_losses = jnp.square(value - batch.targets)
             value_losses_clipped = jnp.square(value_pred_clipped - batch.targets)
             value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-            return self.vf_coef * value_loss
+            return config.vf_coef * value_loss
 
-        loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
+        _loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
         critic_optimizer.update(grads)
 
-    def update(self, batch: AdvantageMinibatch, actor_optimizer: nnx.Optimizer, critic_optimizer: nnx.Optimizer) -> None:
-        """Perform one update step on actor and critic. Mutates optimizers in-place."""
-        self.update_actor(batch, actor_optimizer)
-        self.update_critic(batch, critic_optimizer)
+    # --- Train iteration ---
+    def train_iteration(carry, actor_optimizer, critic_optimizer):
+        actor = actor_optimizer.model
+        critic = critic_optimizer.model
+
+        carry, trajectories = collect_trajectories(carry, actor, critic)
+
+        last_val = critic(carry.last_obs)
+        last_val = jnp.where(carry.last_done, 0, last_val)
+        advantages, targets = calculate_gae(trajectories, last_val)
+
+        def update_epoch(_, state):
+            carry, actor_opt, critic_opt = state
+            rng, minibatch_rng = jax.random.split(carry.rng)
+            carry = carry._replace(rng=rng)
+            batch = AdvantageMinibatch(trajectories, advantages, targets)
+            minibatches = shuffle_and_split(batch, minibatch_rng, iteration_size, config.num_minibatches)
+
+            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+            def update_step(state, mb):
+                actor_opt, critic_opt = state
+                update_actor(mb, actor_opt)
+                update_critic(mb, critic_opt)
+                return (actor_opt, critic_opt)
+
+            actor_opt, critic_opt = update_step((actor_opt, critic_opt), minibatches)
+            return (carry, actor_opt, critic_opt)
+
+        carry, actor_optimizer, critic_optimizer = nnx.fori_loop(
+            0, config.num_epochs, update_epoch, (carry, actor_optimizer, critic_optimizer)
+        )
+        return carry, actor_optimizer, critic_optimizer
+
+    # --- Eval callback ---
+    def eval_callback(carry, actor_optimizer):
+        act_fn = _make_act(actor_optimizer.model, config, carry.obs_rms)
+        return evaluate(act_fn, carry.rng, env, env_params, 128, max_steps)
+
+    # --- Outer training loop ---
+    iteration_steps = num_envs * num_steps
+    num_iters_per_eval = int(np.ceil(config.eval_freq / iteration_steps))
+    num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
+
+    if not config.skip_initial_evaluation:
+        initial_eval = eval_callback(carry, actor_optimizer)
+
+    def eval_iteration(state, _):
+        carry, actor_opt, critic_opt = state
+
+        def train_body(_, s):
+            return train_iteration(*s)
+
+        carry, actor_opt, critic_opt = nnx.fori_loop(0, num_iters_per_eval, train_body, (carry, actor_opt, critic_opt))
+        metrics = eval_callback(carry, actor_opt)
+        return (carry, actor_opt, critic_opt), metrics
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def scan_eval(state, _dummy):
+        return eval_iteration(state, _dummy)
+
+    (carry, actor_optimizer, critic_optimizer), all_metrics = scan_eval(
+        (carry, actor_optimizer, critic_optimizer), jnp.zeros(num_evals)
+    )
+
+    if not config.skip_initial_evaluation:
+        all_metrics = jax.tree.map(
+            lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
+            initial_eval,
+            all_metrics,
+        )
+
+    state = {
+        "actor_optimizer": actor_optimizer,
+        "critic_optimizer": critic_optimizer,
+        "obs_rms_state": carry.obs_rms,
+        "rew_rms_state": carry.rew_rms,
+        "global_step": carry.global_step,
+    }
+    return state, all_metrics

@@ -1,12 +1,10 @@
-import unittest
-
 import jax
+import pytest
 from jax import numpy as jnp
 
 from rejax.compat.navix2gymnax import create_navix
 
 
-# Standard set of Navix environments for testing: smallest size of every one
 # fmt: off
 NAVIX_TEST_ENVS = [
     "Navix-Empty-5x5-v0", "Navix-Empty-Random-5x5-v0", "Navix-DoorKey-5x5-v0",
@@ -18,97 +16,66 @@ NAVIX_TEST_ENVS = [
 # fmt: on
 
 
-class TestNavixCompat(unittest.TestCase):
-    def test_create_navix_environments(self):
-        """Test creating and basic functionality of Navix environments."""
-        rng = jax.random.PRNGKey(0)
+@pytest.mark.parametrize("env_name", NAVIX_TEST_ENVS)
+def test_create_navix_environments(env_name):
+    """Test creating and basic functionality of Navix environments."""
+    rng = jax.random.PRNGKey(0)
 
-        for env_name in NAVIX_TEST_ENVS:
-            with self.subTest(env=env_name):
-                env, params = create_navix(env_name)
+    env, params = create_navix(env_name)
 
-                # JIT the reset and step functions
-                jitted_reset = jax.jit(env.reset)
-                jitted_step = jax.jit(env.step)
+    jitted_reset = jax.jit(env.reset)
+    jitted_step = jax.jit(env.step)
 
-                # Test reset
-                try:
-                    obs, state = jitted_reset(rng, params)
-                except Exception as e:
-                    self.fail(f"Failed to reset {env_name}: {type(e).__name__}: {e}")
+    obs, state = jitted_reset(rng, params)
 
-                # Test observation space
-                try:
-                    obs_space = env.observation_space(params)
-                    self.assertEqual(obs.dtype, obs_space.dtype)
-                    self.assertEqual(obs.shape, obs_space.shape)
-                except Exception as e:
-                    self.fail(f"Failed to get obs space for {env_name}: {type(e).__name__}: {e}")
+    obs_space = env.observation_space(params)
+    assert obs.dtype == obs_space.dtype
+    assert obs.shape == obs_space.shape
 
-                # Test action space and sampling
-                try:
-                    action_space = env.action_space(params)
-                    action = action_space.sample(rng)
-                    self.assertEqual(action.dtype, action_space.dtype)
-                    self.assertEqual(action.shape, action_space.shape)
-                except Exception as e:
-                    self.fail(f"Failed to sample action for {env_name}: {type(e).__name__}: {e}")
+    action_space = env.action_space(params)
+    action = action_space.sample(rng)
+    assert action.dtype == action_space.dtype
+    assert action.shape == action_space.shape
 
-                # Test stepping
-                for step in range(5):
-                    try:
-                        obs, state, reward, done, _info = jitted_step(rng, state, action, params)
+    for step in range(5):
+        obs, state, reward, done, _info = jitted_step(rng, state, action, params)
 
-                        # Check types and shapes
-                        self.assertEqual(obs.dtype, obs_space.dtype)
-                        self.assertEqual(obs.shape, obs_space.shape)
-                        self.assertTrue(hasattr(reward, "dtype"))
-                        self.assertTrue(hasattr(done, "dtype"))
+        assert obs.dtype == obs_space.dtype
+        assert obs.shape == obs_space.shape
+        assert hasattr(reward, "dtype")
+        assert hasattr(done, "dtype")
 
-                        # If episode is done, break
-                        if done:
-                            break
+        if done:
+            break
 
-                    except Exception as e:
-                        self.fail(f"Failed to step {env_name} at step {step}: {type(e).__name__}: {e}")
-
-                    # Sample new action for next step
-                    action = action_space.sample(rng)
-
-    def test_navix_float_obs_wrapper(self):
-        """Test that FloatObsWrapper correctly converts observations to float."""
-        rng = jax.random.PRNGKey(0)
-
-        for env_name in NAVIX_TEST_ENVS:
-            with self.subTest(env=env_name):
-                env, params = create_navix(env_name)
-                obs, state = env.reset(rng, params)
-
-                # Check that observations are float type
-                self.assertTrue(jnp.issubdtype(obs.dtype, jnp.floating))
-
-                # Test that stepping also returns float observations
-                action = env.action_space(params).sample(rng)
-                obs, state, _reward, _done, _info = env.step(rng, state, action, params)
-                self.assertTrue(jnp.issubdtype(obs.dtype, jnp.floating))
-
-    def test_navix_env_params(self):
-        """Test that environment parameters work correctly."""
-        rng = jax.random.PRNGKey(0)
-
-        for env_name in NAVIX_TEST_ENVS:
-            with self.subTest(env=env_name):
-                env, params = create_navix(env_name)
-
-                # Test that params have max_steps_in_episode attribute
-                self.assertTrue(hasattr(params, "max_steps_in_episode"))
-                self.assertIsInstance(params.max_steps_in_episode, int)
-
-                # Test reset with params
-                obs, state = env.reset(rng, params)
-                self.assertIsNotNone(obs)
-                self.assertIsNotNone(state)
+        action = action_space.sample(rng)
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize("env_name", NAVIX_TEST_ENVS)
+def test_navix_float_obs_wrapper(env_name):
+    """Test that FloatObsWrapper correctly converts observations to float."""
+    rng = jax.random.PRNGKey(0)
+
+    env, params = create_navix(env_name)
+    obs, state = env.reset(rng, params)
+
+    assert jnp.issubdtype(obs.dtype, jnp.floating)
+
+    action = env.action_space(params).sample(rng)
+    obs, state, _reward, _done, _info = env.step(rng, state, action, params)
+    assert jnp.issubdtype(obs.dtype, jnp.floating)
+
+
+@pytest.mark.parametrize("env_name", NAVIX_TEST_ENVS)
+def test_navix_env_params(env_name):
+    """Test that environment parameters work correctly."""
+    rng = jax.random.PRNGKey(0)
+
+    env, params = create_navix(env_name)
+
+    assert hasattr(params, "max_steps_in_episode")
+    assert isinstance(params.max_steps_in_episode, int)
+
+    obs, state = env.reset(rng, params)
+    assert obs is not None
+    assert state is not None

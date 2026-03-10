@@ -74,29 +74,6 @@ class DiscretePolicy(nnx.Module):
         return action, action_dist.log_prob(action)
 
 
-def EpsilonGreedyPolicy(qnet_class: type[nnx.Module]) -> type[nnx.Module]:  # noqa: N802
-    """Factory that creates an epsilon-greedy policy from a Q-network class.
-
-    Args:
-        qnet_class: The Q-network class to wrap (e.g., DiscreteQNetwork)
-
-    Returns:
-        A new class that adds epsilon-greedy action selection to the Q-network
-    """
-
-    class EpsilonGreedyPolicyImpl(qnet_class):
-        def _action_dist(self, obs: jax.Array, epsilon: float) -> distrax.EpsilonGreedy:
-            q = self(obs)
-            return distrax.EpsilonGreedy(q, epsilon=epsilon)
-
-        def act(self, obs: jax.Array, rng: jax.Array, epsilon: float = 0.05) -> jax.Array:
-            action_dist = self._action_dist(obs, epsilon)
-            action = action_dist.sample(seed=rng)
-            return action
-
-    return EpsilonGreedyPolicyImpl
-
-
 class GaussianPolicy(nnx.Module):
     """Policy for continuous action spaces with diagonal Gaussian distribution."""
 
@@ -378,6 +355,11 @@ class DiscreteQNetwork(nnx.Module):
         q_values = self(obs)
         return jnp.take_along_axis(q_values, action[:, None], axis=1).squeeze(1)
 
+    def act(self, obs: jax.Array, rng: jax.Array, epsilon: float = 0.05) -> jax.Array:
+        q = self(obs)
+        action_dist = distrax.EpsilonGreedy(q, epsilon=epsilon)
+        return action_dist.sample(seed=rng)
+
 
 class DuelingQNetwork(nnx.Module):
     """Dueling Q-network architecture with separate value and advantage streams."""
@@ -406,6 +388,11 @@ class DuelingQNetwork(nnx.Module):
         """Get Q-values for specific actions."""
         q_values = self(obs)
         return jnp.take_along_axis(q_values, action[:, None], axis=1).squeeze(1)
+
+    def act(self, obs: jax.Array, rng: jax.Array, epsilon: float = 0.05) -> jax.Array:
+        q = self(obs)
+        action_dist = distrax.EpsilonGreedy(q, epsilon=epsilon)
+        return action_dist.sample(seed=rng)
 
 
 class ImplicitQuantileNetwork(nnx.Module):
@@ -498,3 +485,9 @@ class ImplicitQuantileNetwork(nnx.Module):
         q = self.q(obs, rng, num_samples)
         best_action = jnp.argmax(q, axis=1)
         return best_action
+
+    def act(self, obs: jax.Array, rng: jax.Array, epsilon: float = 0.05) -> jax.Array:
+        rng_tau, rng_epsilon = jax.random.split(rng)
+        q = self.q(obs, rng_tau)
+        action_dist = distrax.EpsilonGreedy(q, epsilon=epsilon)
+        return action_dist.sample(seed=rng_epsilon)

@@ -1,28 +1,32 @@
-"""Proximal Q-Network (PQN).
+"""Proximal Q-Network (PQN) — standalone training function.
 
 Adapted from https://github.com/mttga/purejaxql/blob/main/purejaxql/pqn_gymnax.py
 by Matteo Gallici et. al.
 """
 
-from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import chex
+import gymnax
 import jax
 import numpy as np
 import optax
 from flax import nnx, struct
-from gymnax.environments.environment import Environment
 from jax import numpy as jnp
+from optax import linear_schedule
 
-from rejax.algos.algorithm import Algorithm, register_init
-from rejax.algos.mixins import (
-    EpsilonGreedyMixin,
-    NormalizeObservationsMixin,
-    NormalizeRewardsMixin,
-    OnPolicyMixin,
+from rejax.algos.utils import (
+    FloatObsWrapper,
+    RewardRMSState,
+    RMSState,
+    normalize_obs,
+    shuffle_and_split,
+    update_and_normalize_obs,
+    update_and_normalize_rew,
 )
-from rejax.networks import DiscreteQNetwork, EpsilonGreedyPolicy
+from rejax.compat import create
+from rejax.evaluate import evaluate
+from rejax.networks import DiscreteQNetwork
 
 
 class Trajectory(struct.PyTreeNode):
@@ -42,227 +46,185 @@ class TargetMinibatch(struct.PyTreeNode):
     targets: chex.Array
 
 
-class PQN(
-    OnPolicyMixin,
-    EpsilonGreedyMixin,
-    NormalizeObservationsMixin,
-    NormalizeRewardsMixin,
-    Algorithm,
-):
-    """Proximal Q-Network algorithm.
+class PQNCarry(NamedTuple):
+    """Non-module carry state for PQN training."""
 
-    PQN is an on-policy Q-learning algorithm that uses epsilon-greedy
-    exploration and TD-lambda returns.
+    rng: chex.PRNGKey
+    env_state: Any
+    last_obs: chex.Array
+    last_done: chex.Array
+    global_step: int
+    obs_rms: RMSState
+    rew_rms: RewardRMSState
+
+
+def _create_env(config):
+    if isinstance(config.env, str):
+        env, env_params = create(config.env)
+    else:
+        env = config.env
+        env_params = getattr(config, "env_params", None) or env.default_params
+    if config.normalize_observations:
+        env = FloatObsWrapper(env)
+    return env, env_params
+
+
+def _create_networks(config, env, env_params, rng):
+    """Create Q-network and optimizer."""
+    agent_kwargs = {}
+    if hasattr(config, "agent_kwargs") and config.agent_kwargs is not None:
+        import dataclasses
+
+        agent_kwargs = dataclasses.asdict(config.agent_kwargs)
+
+    activation = agent_kwargs.pop("activation", "relu")
+    agent_kwargs["activation"] = getattr(nnx, activation)
+    hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
+    agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
+
+    action_dim = env.action_space(env_params).n
+    obs_space = env.observation_space(env_params)
+    in_features = int(np.prod(obs_space.shape))
+
+    q_kwargs = {"in_features": in_features, "action_dim": action_dim, **agent_kwargs}
+
+    q_network = DiscreteQNetwork(**q_kwargs, rngs=nnx.Rngs(rng))
+
+    tx = optax.chain(
+        optax.clip(config.max_grad_norm),
+        optax.adam(learning_rate=config.learning_rate),
+    )
+    q_optimizer = nnx.Optimizer(q_network, tx)
+    return q_optimizer
+
+
+def _make_act(q_network, config, obs_rms=None):
+    """Build eval policy closure."""
+
+    def act(obs, rng):
+        if config.normalize_observations and obs_rms is not None:
+            obs = normalize_obs(obs_rms, obs)
+        obs = jnp.expand_dims(obs, 0)
+        return jnp.squeeze(q_network.act(obs, rng, epsilon=0.005))
+
+    return act
+
+
+def train_pqn(config, rng, *, env=None, env_params=None):
+    """Train PQN. Designed to be JIT-able and vmap-able over rng.
+
+    Args:
+        config: PQNConfig dataclass
+        rng: PRNG key
+        env: Optional environment (overrides config.env)
+        env_params: Optional env params
+
+    Returns:
+        (state_dict, eval_metrics) where state_dict contains trained NNX modules
     """
+    # --- Setup ---
+    if env is None:
+        env, env_params = _create_env(config)
+    else:
+        if env_params is None:
+            env_params = env.default_params
+        if config.normalize_observations:
+            env = FloatObsWrapper(env)
 
-    # Network module types
-    q_network_cls: type[nnx.Module] = struct.field(pytree_node=False, default=None)
-    q_network_kwargs: dict = struct.field(pytree_node=False, default=None)
+    eps_schedule = linear_schedule(
+        config.eps_start,
+        config.eps_end,
+        int(config.exploration_fraction * config.total_timesteps),
+    )
 
-    # PQN hyperparameters
-    num_epochs: int = struct.field(pytree_node=False, default=1)
-    td_lambda: chex.Scalar = struct.field(pytree_node=True, default=0.9)
+    num_envs = config.num_envs
+    num_steps = config.num_steps
+    action_space = env.action_space(env_params)
+    obs_space = env.observation_space(env_params)
+    max_steps = env_params.max_steps_in_episode
+    discrete = isinstance(action_space, gymnax.environments.spaces.Discrete)
+    assert discrete, "PQN requires discrete action space"
 
-    def make_act(self, ts: Any) -> Callable:
-        """Create an action selection function for evaluation.
+    iteration_size = num_envs * num_steps
+    assert iteration_size % config.num_minibatches == 0
 
-        Args:
-            ts: Training state containing network states
+    vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
+    vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
-        Returns:
-            Function that takes (obs, rng) and returns an action
-        """
-        # Reconstruct optimizer and extract Q-network
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-        q_network = q_optimizer.model
+    # Create networks
+    rng, rng_net = jax.random.split(rng)
+    q_optimizer = _create_networks(config, env, env_params, rng_net)
 
-        def act(obs: jax.Array, rng: chex.PRNGKey) -> jax.Array:
-            if getattr(self, "normalize_observations", False):
-                obs = self.normalize_obs(ts.obs_rms_state, obs)
+    # Init env
+    rng, rng_env = jax.random.split(rng)
+    obs, env_state = vmap_reset(jax.random.split(rng_env, num_envs), env_params)
 
-            obs = jnp.expand_dims(obs, 0)
-            action = q_network.act(obs, rng, epsilon=0.005)
-            return jnp.squeeze(action)
+    # Init normalization
+    obs_rms = RMSState.create(obs_space.shape)
+    rew_rms = RewardRMSState.create(num_envs)
 
-        return act
+    carry = PQNCarry(
+        rng=rng,
+        env_state=env_state,
+        last_obs=obs,
+        last_done=jnp.zeros(num_envs, dtype=bool),
+        global_step=0,
+        obs_rms=obs_rms,
+        rew_rms=rew_rms,
+    )
 
-    @classmethod
-    def create_agent(cls, config: dict, env: Environment, env_params: Any) -> dict:
-        """Create Q-network configuration.
+    # --- Collect trajectories ---
+    def collect_trajectories(carry, q_network):
+        """Roll out epsilon-greedy policy for num_steps. Q-network is read-only."""
+        epsilon = eps_schedule(carry.global_step)
 
-        Args:
-            config: Configuration dictionary, modified in-place
-            env: Environment instance
-            env_params: Environment parameters
-
-        Returns:
-            Dictionary with network class type and kwargs
-        """
-        agent_kwargs = config.pop("agent_kwargs", {})
-        # Note: Original Linen version uses LayerNorm + ReLU activation,
-        # but this requires modifying the MLP to insert LayerNorm layers.
-        # Using standard ReLU for now - can be extended later if needed.
-        activation = agent_kwargs.pop("activation", "relu")
-        agent_kwargs["activation"] = getattr(nnx, activation) if isinstance(activation, str) else activation
-
-        action_dim = env.action_space(env_params).n
-        obs_space = env.observation_space(env_params)
-        in_features = int(np.prod(obs_space.shape))
-
-        # Create wrapped network class
-        q_network_cls = EpsilonGreedyPolicy(DiscreteQNetwork)
-        q_network_kwargs = {
-            "in_features": in_features,
-            "hidden_layer_sizes": (64, 64),
-            "action_dim": action_dim,
-            **agent_kwargs,
-        }
-
-        return {
-            "q_network_cls": q_network_cls,
-            "q_network_kwargs": q_network_kwargs,
-        }
-
-    @register_init
-    def initialize_network_params(self, rng: chex.PRNGKey) -> dict:
-        """Initialize Q-network with optimizer.
-
-        Args:
-            rng: RNG key for network initialization
-
-        Returns:
-            Dictionary with network graphdef and state
-        """
-        # Create network
-        q_network = self.q_network_cls(**self.q_network_kwargs, rngs=nnx.Rngs(rng))
-
-        # Create optimizer
-        tx = optax.chain(
-            optax.clip(self.max_grad_norm),
-            optax.adam(learning_rate=self.learning_rate),
-        )
-        q_optimizer = nnx.Optimizer(q_network, tx)
-
-        # Split into graphdef and state for JAX transforms
-        q_graphdef, q_state = nnx.split(q_optimizer)
-
-        return {
-            "q_graphdef": q_graphdef,
-            "q_state": q_state,
-        }
-
-    def train_iteration(self, ts: Any) -> Any:
-        """Run one training iteration (collect trajectories + multiple epochs of updates).
-
-        Args:
-            ts: Training state
-
-        Returns:
-            Updated training state
-        """
-        # Merge once at top
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-        q_network = q_optimizer.model
-
-        epsilon = self.epsilon_schedule(ts.global_step)
-        ts, trajectories = self.collect_trajectories(ts, epsilon, q_network)
-
-        last_q = q_network(ts.last_obs)
-        max_last_q = last_q.max(axis=1)
-        max_last_q = jnp.where(ts.last_done, 0, max_last_q)
-        targets = self.calculate_targets(trajectories, max_last_q)
-
-        def update_epoch(_, state):
-            ts, q_opt = state
-            rng, minibatch_rng = jax.random.split(ts.rng)
-            ts = ts.replace(rng=rng)
-
-            batch = TargetMinibatch(trajectories, targets)
-            minibatches = self.shuffle_and_split(batch, minibatch_rng)
-
-            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
-            def update_step(carry, mb):
-                ts, q_opt = carry
-                self.update(ts, mb, q_opt)
-                return (ts, q_opt)
-
-            ts, q_opt = update_step((ts, q_opt), minibatches)
-            return (ts, q_opt)
-
-        ts, q_optimizer = nnx.fori_loop(0, self.num_epochs, update_epoch, (ts, q_optimizer))
-
-        # Split once at bottom
-        _, q_state = nnx.split(q_optimizer)
-        return ts.replace(q_state=q_state)
-
-    def collect_trajectories(self, ts: Any, epsilon: float, q_network: nnx.Module) -> tuple[Any, Trajectory]:
-        """Collect trajectories by rolling out the current policy.
-
-        Args:
-            ts: Training state
-            epsilon: Exploration epsilon for epsilon-greedy
-            q_network: Live Q-network module for action selection
-
-        Returns:
-            Tuple of (updated_ts, trajectories)
-        """
-
-        def env_step(ts: Any, unused: None) -> tuple:
-            rng, new_rng = jax.random.split(ts.rng)
-            ts = ts.replace(rng=rng)
+        def env_step(carry, _):
+            rng, new_rng = jax.random.split(carry.rng)
+            carry = carry._replace(rng=rng)
             rng_action, rng_step = jax.random.split(new_rng)
 
             # Sample action using epsilon-greedy policy
-            action = q_network.act(ts.last_obs, rng_action, epsilon=epsilon)
+            action = q_network.act(carry.last_obs, rng_action, epsilon=epsilon)
 
             # Step environment
-            rng_step = jax.random.split(rng_step, self.num_envs)
-            transition = self.vmap_step(rng_step, ts.env_state, action, self.env_params)
-            next_obs, env_state, reward, done, _ = transition
+            rng_steps = jax.random.split(rng_step, num_envs)
+            next_obs, new_env_state, reward, done, _ = vmap_step(rng_steps, carry.env_state, action, env_params)
 
             # Compute Q-values for next state
             next_q = q_network(next_obs)
 
-            if self.normalize_observations:
-                obs_rms_state, next_obs = self.update_and_normalize_obs(ts.obs_rms_state, next_obs)
-                ts = ts.replace(obs_rms_state=obs_rms_state)
-            if self.normalize_rewards:
-                rew_rms_state, reward = self.update_and_normalize_rew(ts.rew_rms_state, reward, done)
-                ts = ts.replace(rew_rms_state=rew_rms_state)
+            obs_rms = carry.obs_rms
+            rew_rms = carry.rew_rms
+            if config.normalize_observations:
+                obs_rms, next_obs = update_and_normalize_obs(obs_rms, next_obs)
+            if config.normalize_rewards:
+                rew_rms, reward = update_and_normalize_rew(rew_rms, reward, done, config.gamma)
 
-            # Return updated state and transition
-            transition = Trajectory(ts.last_obs, action, next_q, reward, done)
-            ts = ts.replace(
-                env_state=env_state,
+            transition = Trajectory(carry.last_obs, action, next_q, reward, done)
+            carry = carry._replace(
+                env_state=new_env_state,
                 last_obs=next_obs,
                 last_done=done,
-                global_step=ts.global_step + self.num_envs,
+                global_step=carry.global_step + num_envs,
+                obs_rms=obs_rms,
+                rew_rms=rew_rms,
             )
-            return ts, transition
+            return carry, transition
 
-        ts, trajectories = jax.lax.scan(env_step, ts, None, self.num_steps)
-        return ts, trajectories
+        carry, trajectories = jax.lax.scan(env_step, carry, None, num_steps)
+        return carry, trajectories
 
-    def calculate_targets(self, trajectories: Trajectory, max_last_q: jax.Array) -> jax.Array:
-        """Calculate TD-lambda targets.
-
-        Args:
-            trajectories: Collected trajectory data
-            max_last_q: Maximum Q-value for the final state
-
-        Returns:
-            TD-lambda targets for each timestep
-        """
-
-        def get_target(lambda_return_and_next_q: tuple, t: Trajectory) -> tuple:
+    # --- Calculate TD-lambda targets ---
+    def calculate_targets(trajectories, max_last_q):
+        def get_target(lambda_return_and_next_q, t):
             lambda_return, next_q = lambda_return_and_next_q
-            return_bootstrap = next_q + self.td_lambda * (lambda_return - next_q)
-            lambda_return = t.reward + (1 - t.done) * self.gamma * return_bootstrap
+            return_bootstrap = next_q + config.td_lambda * (lambda_return - next_q)
+            lambda_return = t.reward + (1 - t.done) * config.gamma * return_bootstrap
             max_next_q = t.next_q.max(axis=1)
             return (lambda_return, max_next_q), lambda_return
 
         max_last_q = jnp.where(trajectories.done[-1], 0, max_last_q)
-        lambda_returns = trajectories.reward[-1] + self.gamma * max_last_q
+        lambda_returns = trajectories.reward[-1] + config.gamma * max_last_q
         _, targets = jax.lax.scan(
             get_target,
             (lambda_returns, max_last_q),
@@ -272,22 +234,88 @@ class PQN(
         targets = jnp.concatenate((targets, lambda_returns[None]))
         return targets
 
-    def update(self, ts: Any, minibatch: TargetMinibatch, q_optimizer: nnx.Optimizer) -> None:
-        """Perform one update step on the Q-network.
-
-        Mutates q_optimizer in-place via NNX lifted transforms.
-
-        Args:
-            ts: Training state
-            minibatch: Minibatch of data
-            q_optimizer: Live Q-network optimizer
-        """
+    # --- Update Q-network ---
+    def update_q(mb, q_optimizer):
         q_network = q_optimizer.model
-        tr, ta = minibatch.trajectories, minibatch.targets
+        tr, ta = mb.trajectories, mb.targets
 
-        def loss_fn(model: nnx.Module) -> jax.Array:
+        def loss_fn(model):
             q_values = model.take(tr.obs, tr.action)
             return optax.l2_loss(q_values, ta).mean()
 
-        loss, grads = nnx.value_and_grad(loss_fn)(q_network)
+        _loss, grads = nnx.value_and_grad(loss_fn)(q_network)
         q_optimizer.update(grads)
+
+    # --- Train iteration ---
+    def train_iteration(carry, q_optimizer):
+        q_network = q_optimizer.model
+
+        carry, trajectories = collect_trajectories(carry, q_network)
+
+        last_q = q_network(carry.last_obs)
+        max_last_q = last_q.max(axis=1)
+        max_last_q = jnp.where(carry.last_done, 0, max_last_q)
+        targets = calculate_targets(trajectories, max_last_q)
+
+        def update_epoch(_, state):
+            carry, q_opt = state
+            rng, minibatch_rng = jax.random.split(carry.rng)
+            carry = carry._replace(rng=rng)
+
+            batch = TargetMinibatch(trajectories, targets)
+            minibatches = shuffle_and_split(batch, minibatch_rng, iteration_size, config.num_minibatches)
+
+            @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=nnx.Carry)
+            def update_step(q_opt, mb):
+                update_q(mb, q_opt)
+                return q_opt
+
+            q_opt = update_step(q_opt, minibatches)
+            return (carry, q_opt)
+
+        carry, q_optimizer = nnx.fori_loop(0, config.num_epochs, update_epoch, (carry, q_optimizer))
+        return carry, q_optimizer
+
+    # --- Eval callback ---
+    def eval_callback(carry, q_optimizer):
+        act_fn = _make_act(q_optimizer.model, config, carry.obs_rms)
+        return evaluate(act_fn, carry.rng, env, env_params, 128, max_steps)
+
+    # --- Outer training loop ---
+    iteration_steps = num_envs * num_steps
+    num_iters_per_eval = int(np.ceil(config.eval_freq / iteration_steps))
+    num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
+
+    if not config.skip_initial_evaluation:
+        initial_eval = eval_callback(carry, q_optimizer)
+
+    def eval_iteration(state, _):
+        carry, q_opt = state
+
+        def train_body(_, s):
+            return train_iteration(*s)
+
+        carry, q_opt = nnx.fori_loop(0, num_iters_per_eval, train_body, (carry, q_opt))
+        metrics = eval_callback(carry, q_opt)
+        return (carry, q_opt), metrics
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def scan_eval(state, _dummy):
+        return eval_iteration(state, _dummy)
+
+    (carry, q_optimizer), all_metrics = scan_eval((carry, q_optimizer), jnp.zeros(num_evals))
+
+    if not config.skip_initial_evaluation:
+        all_metrics = jax.tree.map(
+            lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
+            initial_eval,
+            all_metrics,
+        )
+
+    state = {
+        "q_optimizer": q_optimizer,
+        "obs_rms_state": carry.obs_rms,
+        "rew_rms_state": carry.rew_rms,
+        "global_step": carry.global_step,
+    }
+    return state, all_metrics

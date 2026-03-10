@@ -1,154 +1,114 @@
-import unittest
-
 import jax
+import pytest
 
 from rejax.compat.gymnasium2gymnax import create_gymnasium
 
 
-class TestGymnasiumCompat(unittest.TestCase):
-    def test_create_gymnasium_environments(self):
-        """Test creating and basic functionality of Gymnasium environments."""
-        rng = jax.random.PRNGKey(0)
-
-        # Test common Gymnasium environments
-        # fmt: off
-        gymnasium_envs = [
-            "CartPole-v1", "MountainCar-v0", "Acrobot-v1", "Pendulum-v1",
-        ]
-        # fmt: on
-
-        for env_name in gymnasium_envs:
-            with self.subTest(env=env_name):
-                try:
-                    env, params = create_gymnasium(env_name)
-                except Exception as e:
-                    # Skip environments that might not be available
-                    self.skipTest(f"Environment {env_name} not available: {e}")
-
-                # JIT the reset and step functions
-                jitted_reset = jax.jit(env.reset)
-                jitted_step = jax.jit(env.step)
-
-                # Test reset
-                try:
-                    obs, state = jitted_reset(rng, params)
-                except Exception as e:
-                    self.fail(f"Failed to reset {env_name}: {type(e).__name__}: {e}")
-
-                # Test observation space
-                try:
-                    obs_space = env.observation_space(params)
-                    self.assertEqual(obs.dtype, obs_space.dtype)
-                    self.assertEqual(obs.shape, obs_space.shape)
-                except Exception as e:
-                    self.fail(f"Failed to get obs space for {env_name}: {type(e).__name__}: {e}")
-
-                # Test action space and sampling
-                try:
-                    action_space = env.action_space(params)
-                    action = action_space.sample(rng)
-                    self.assertEqual(action.dtype, action_space.dtype)
-                    self.assertEqual(action.shape, action_space.shape)
-                except Exception as e:
-                    self.fail(f"Failed to sample action for {env_name}: {type(e).__name__}: {e}")
-
-                # Test stepping
-                for step in range(10):
-                    try:
-                        obs, state, reward, done, _info = jitted_step(rng, state, action, params)
-
-                        # Check types and shapes
-                        self.assertEqual(obs.dtype, obs_space.dtype)
-                        self.assertEqual(obs.shape, obs_space.shape)
-                        self.assertTrue(hasattr(reward, "dtype"))
-                        self.assertTrue(hasattr(done, "dtype"))
-
-                        # If episode is done, break
-                        if done:
-                            break
-
-                    except Exception as e:
-                        self.fail(f"Failed to step {env_name} at step {step}: {type(e).__name__}: {e}")
-
-                    # Sample new action for next step
-                    action = action_space.sample(rng)
-
-    def test_gymnasium_discrete_environments(self):
-        """Test discrete action environments specifically."""
-        rng = jax.random.PRNGKey(0)
-
-        # fmt: off
-        discrete_envs = ["CartPole-v1", "MountainCar-v0", "Acrobot-v1"]
-        # fmt: on
-
-        for env_name in discrete_envs:
-            with self.subTest(env=env_name):
-                try:
-                    env, params = create_gymnasium(env_name)
-                except Exception:
-                    self.skipTest(f"Environment {env_name} not available")
-
-                # Test that action space is discrete
-                action_space = env.action_space(params)
-                from gymnax.environments.spaces import Discrete
-
-                self.assertIsInstance(action_space, Discrete)
-
-                # Test action sampling and stepping
-                obs, state = env.reset(rng, params)
-                action = action_space.sample(rng)
-                obs, state, reward, done, _info = env.step(rng, state, action, params)
-
-                self.assertIsNotNone(obs)
-                self.assertIsNotNone(reward)
-                self.assertIsNotNone(done)
-
-    def test_gymnasium_continuous_environments(self):
-        """Test continuous action environments specifically."""
-        rng = jax.random.PRNGKey(0)
-
-        continuous_envs = ["Pendulum-v1"]
-
-        for env_name in continuous_envs:
-            with self.subTest(env=env_name):
-                try:
-                    env, params = create_gymnasium(env_name)
-                except Exception:
-                    self.skipTest(f"Environment {env_name} not available")
-
-                # Test that action space is continuous (Box)
-                action_space = env.action_space(params)
-                from gymnax.environments.spaces import Box
-
-                self.assertIsInstance(action_space, Box)
-
-                # Test action sampling and stepping
-                obs, state = env.reset(rng, params)
-                action = action_space.sample(rng)
-                obs, state, reward, done, _info = env.step(rng, state, action, params)
-
-                self.assertIsNotNone(obs)
-                self.assertIsNotNone(reward)
-                self.assertIsNotNone(done)
-
-    def test_gymnasium_env_params(self):
-        """Test that environment parameters work correctly."""
-        rng = jax.random.PRNGKey(0)
-
-        try:
-            env, params = create_gymnasium("CartPole-v1")
-        except Exception:
-            self.skipTest("CartPole environment not available")
-
-        # Test that params have max_steps_in_episode attribute
-        self.assertTrue(hasattr(params, "max_steps_in_episode"))
-        self.assertIsInstance(params.max_steps_in_episode, int)
-
-        # Test reset with params
-        obs, state = env.reset(rng, params)
-        self.assertIsNotNone(obs)
-        self.assertIsNotNone(state)
+# fmt: off
+GYMNASIUM_ENVS = ["CartPole-v1", "MountainCar-v0", "Acrobot-v1", "Pendulum-v1"]
+DISCRETE_ENVS = ["CartPole-v1", "MountainCar-v0", "Acrobot-v1"]
+CONTINUOUS_ENVS = ["Pendulum-v1"]
+# fmt: on
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize("env_name", GYMNASIUM_ENVS)
+def test_create_gymnasium_environments(env_name):
+    """Test creating and basic functionality of Gymnasium environments."""
+    rng = jax.random.PRNGKey(0)
+
+    try:
+        env, params = create_gymnasium(env_name)
+    except Exception as e:
+        pytest.skip(f"Environment {env_name} not available: {e}")
+
+    jitted_reset = jax.jit(env.reset)
+    jitted_step = jax.jit(env.step)
+
+    obs, state = jitted_reset(rng, params)
+
+    obs_space = env.observation_space(params)
+    assert obs.dtype == obs_space.dtype
+    assert obs.shape == obs_space.shape
+
+    action_space = env.action_space(params)
+    action = action_space.sample(rng)
+    assert action.dtype == action_space.dtype
+    assert action.shape == action_space.shape
+
+    for step in range(10):
+        obs, state, reward, done, _info = jitted_step(rng, state, action, params)
+
+        assert obs.dtype == obs_space.dtype
+        assert obs.shape == obs_space.shape
+        assert hasattr(reward, "dtype")
+        assert hasattr(done, "dtype")
+
+        if done:
+            break
+
+        action = action_space.sample(rng)
+
+
+@pytest.mark.parametrize("env_name", DISCRETE_ENVS)
+def test_gymnasium_discrete_environments(env_name):
+    """Test discrete action environments specifically."""
+    rng = jax.random.PRNGKey(0)
+
+    try:
+        env, params = create_gymnasium(env_name)
+    except Exception:
+        pytest.skip(f"Environment {env_name} not available")
+
+    action_space = env.action_space(params)
+    from gymnax.environments.spaces import Discrete
+
+    assert isinstance(action_space, Discrete)
+
+    obs, state = env.reset(rng, params)
+    action = action_space.sample(rng)
+    obs, state, reward, done, _info = env.step(rng, state, action, params)
+
+    assert obs is not None
+    assert reward is not None
+    assert done is not None
+
+
+@pytest.mark.parametrize("env_name", CONTINUOUS_ENVS)
+def test_gymnasium_continuous_environments(env_name):
+    """Test continuous action environments specifically."""
+    rng = jax.random.PRNGKey(0)
+
+    try:
+        env, params = create_gymnasium(env_name)
+    except Exception:
+        pytest.skip(f"Environment {env_name} not available")
+
+    action_space = env.action_space(params)
+    from gymnax.environments.spaces import Box
+
+    assert isinstance(action_space, Box)
+
+    obs, state = env.reset(rng, params)
+    action = action_space.sample(rng)
+    obs, state, reward, done, _info = env.step(rng, state, action, params)
+
+    assert obs is not None
+    assert reward is not None
+    assert done is not None
+
+
+def test_gymnasium_env_params():
+    """Test that environment parameters work correctly."""
+    rng = jax.random.PRNGKey(0)
+
+    try:
+        env, params = create_gymnasium("CartPole-v1")
+    except Exception:
+        pytest.skip("CartPole environment not available")
+
+    assert hasattr(params, "max_steps_in_episode")
+    assert isinstance(params.max_steps_in_episode, int)
+
+    obs, state = env.reset(rng, params)
+    assert obs is not None
+    assert state is not None

@@ -1,12 +1,10 @@
-import typing
-import unittest
 from functools import partial
 
 import jax
-from flax import nnx
+import pytest
 from jax import numpy as jnp
 
-from rejax import TD3
+from rejax import TD3Config, train_td3
 
 from .environments import (
     TestEnv1Continuous,
@@ -17,148 +15,144 @@ from .environments import (
 )
 
 
-def get_critics(ts, num_critics=2):
-    """Reconstruct critic networks from NNX training state."""
-    critics = []
-    for i in range(num_critics):
-        state_i = jax.tree.map(lambda x: x[i], ts.critic_state)
-        critic_opt = nnx.merge(ts.critic_graphdef, state_i)
-        critics.append(critic_opt.model)
-    return critics
+ARGS = {
+    "num_envs": 1,
+    "learning_rate": 0.0003,
+    "total_timesteps": 16384,
+    "eval_freq": 16384,
+    "skip_initial_evaluation": True,
+}
 
 
-def q_fn_from_critics(critics):
-    """Create a Q-function that evaluates all critics and stacks results."""
+def _train(env):
+    config = TD3Config(**ARGS)
+    return train_td3(config, jax.random.PRNGKey(0), env=env)
 
+
+def _get_critics(state):
+    return [opt.model for opt in state["critic_optimizers"]]
+
+
+def _q_fn_from_critics(critics):
     def q_fn(obs, actions):
         return jnp.stack([c(obs, actions) for c in critics])
 
     return q_fn
 
 
-class TestEnvironmentsTD3(unittest.TestCase):
-    args: typing.ClassVar[dict] = {
-        "num_envs": 1,
-        "learning_rate": 0.0003,
-        "total_timesteps": 16384,
-        "eval_freq": 16384,
-        "skip_initial_evaluation": True,
-    }
+def _make_act(state, config=None):
+    from rejax.algos.td3 import _make_act
 
-    def train_fn(self, td3):
-        return TD3.train(td3, rng=jax.random.PRNGKey(0))
+    cfg = config or TD3Config(**ARGS)
+    return _make_act(state["actor_optimizer"].model, cfg, state.get("obs_rms_state"))
 
-    def test_env1(self):
-        env = TestEnv1Continuous()
-        td3 = TD3.create(env=env, **self.args)
-        ts, _ = self.train_fn(td3)
-        act = td3.make_act(ts)
 
-        rng = jax.random.PRNGKey(0)
-        rngs = jax.random.split(rng, 10)
-        obs = jax.numpy.zeros((10, 1))
-        actions = jax.vmap(act)(obs, rngs)
+def test_env1():
+    state, _ = _train(TestEnv1Continuous())
+    act = _make_act(state)
 
-        actions = jax.numpy.expand_dims(actions, 1)
-        q_fn = q_fn_from_critics(get_critics(ts))
+    rng = jax.random.PRNGKey(0)
+    rngs = jax.random.split(rng, 10)
+    obs = jax.numpy.zeros((10, 1))
+    actions = jax.vmap(act)(obs, rngs)
 
-        qs = q_fn(obs, actions)
+    actions = jax.numpy.expand_dims(actions, 1)
+    q_fn = _q_fn_from_critics(_get_critics(state))
+
+    qs = q_fn(obs, actions)
+    value = qs.min(axis=0)
+
+    for v in value:
+        assert v == pytest.approx(1.0, abs=0.1)
+
+
+def test_env2():
+    state, _ = _train(TestEnv2Continuous())
+    act = _make_act(state)
+
+    rng = jax.random.PRNGKey(0)
+    rngs = jax.random.split(rng, 10)
+    obs = jax.random.uniform(rng, (10, 1), minval=-1, maxval=1)
+    actions = jax.vmap(act)(obs, rngs)
+    actions = jax.numpy.expand_dims(actions, 1)
+    q_fn = _q_fn_from_critics(_get_critics(state))
+
+    qs = q_fn(obs, actions)
+    value = qs.min(axis=0)
+
+    for v, r in zip(value, obs):
+        assert v == pytest.approx(r, abs=0.1)
+
+
+def test_env3():
+    state, _ = _train(TestEnv3Continuous())
+    act = _make_act(state)
+    q_fn = _q_fn_from_critics(_get_critics(state))
+    gamma = TD3Config(**ARGS).gamma
+
+    @partial(jax.vmap, in_axes=(None, 0))
+    def test_i(obs, rng):
+        action = act(obs, rng)
+        action = jax.numpy.expand_dims(action, 0)
+        obs = jax.numpy.expand_dims(obs, 0)
+        action = jax.numpy.expand_dims(action, 1)
+
+        qs = q_fn(obs, action)
         value = qs.min(axis=0)
+        return value
 
-        for v in value:
-            self.assertAlmostEqual(v, 1.0, delta=0.1)
+    rngs = jax.random.split(jax.random.PRNGKey(0), 10)
+    for obs in jax.numpy.array([[-1], [1]]):
+        r = 1 * gamma if obs == -1 else 1
+        for v in test_i(obs, rngs):
+            assert v == pytest.approx(r, abs=0.1)
 
-    def test_env2(self):
-        env = TestEnv2Continuous()
-        td3 = TD3.create(env=env, **self.args)
-        ts, _ = self.train_fn(td3)
-        act = td3.make_act(ts)
 
-        rng = jax.random.PRNGKey(0)
-        rngs = jax.random.split(rng, 10)
-        obs = jax.random.uniform(rng, (10, 1), minval=-1, maxval=1)
-        actions = jax.vmap(act)(obs, rngs)
-        actions = jax.numpy.expand_dims(actions, 1)
-        q_fn = q_fn_from_critics(get_critics(ts))
+def test_env4():
+    state, _ = _train(TestEnv4Continuous())
+    act = _make_act(state)
+    q_fn = _q_fn_from_critics(_get_critics(state))
 
-        qs = q_fn(obs, actions)
+    @partial(jax.vmap, in_axes=(None, 0))
+    def test_i(obs, rng):
+        action = act(obs, rng)
+        action = jax.numpy.expand_dims(action, 0)
+        obs = jax.numpy.expand_dims(obs, 0)
+        action = jax.numpy.expand_dims(action, 1)
+
+        qs = q_fn(obs, action)
         value = qs.min(axis=0)
+        return value, action
 
-        for v, r in zip(value, obs):
-            self.assertAlmostEqual(v, r, delta=0.1)
+    rngs = jax.random.split(jax.random.PRNGKey(0), 10)
+    obs = jax.numpy.array([0])
+    vv, aa = test_i(obs, rngs)
+    for v, a in zip(vv, aa):
+        assert v >= 1.0
+        assert a == pytest.approx(2.0, abs=0.1)
 
-    def test_env3(self):
-        env = TestEnv3Continuous()
-        td3 = TD3.create(env=env, **self.args)
-        ts, _ = self.train_fn(td3)
-        act = td3.make_act(ts)
-        q_fn = q_fn_from_critics(get_critics(ts))
 
-        @partial(jax.vmap, in_axes=(None, 0))
-        def test_i(obs, rng):
-            action = act(obs, rng)
-            action = jax.numpy.expand_dims(action, 0)
-            obs = jax.numpy.expand_dims(obs, 0)
-            action = jax.numpy.expand_dims(action, 1)
+def test_env5():
+    state, _ = _train(TestEnv5Continuous())
+    act = _make_act(state)
+    q_fn = _q_fn_from_critics(_get_critics(state))
 
-            qs = q_fn(obs, action)
-            value = qs.min(axis=0)
-            return value
+    @partial(jax.vmap, in_axes=(None, 0))
+    def test_i(obs, rng):
+        action = act(obs, rng)
+        action = jax.numpy.expand_dims(action, 0)
+        obs = jax.numpy.expand_dims(obs, 0)
+        action = jax.numpy.expand_dims(action, 1)
 
-        rngs = jax.random.split(jax.random.PRNGKey(0), 10)
-        for obs in jax.numpy.array([[-1], [1]]):
-            r = 1 * td3.gamma if obs == -1 else 1
-            for v in test_i(obs, rngs):
-                self.assertAlmostEqual(v, r, delta=0.1)
+        qs = q_fn(obs, action)
+        value = qs.min(axis=0)
+        return value, action.squeeze(1)
 
-    def test_env4(self):
-        env = TestEnv4Continuous()
-        td3 = TD3.create(env=env, **self.args)
-        ts, _ = self.train_fn(td3)
-        act = td3.make_act(ts)
-        q_fn = q_fn_from_critics(get_critics(ts))
-
-        @partial(jax.vmap, in_axes=(None, 0))
-        def test_i(obs, rng):
-            action = act(obs, rng)
-            action = jax.numpy.expand_dims(action, 0)
-            obs = jax.numpy.expand_dims(obs, 0)
-            action = jax.numpy.expand_dims(action, 1)
-
-            qs = q_fn(obs, action)
-            value = qs.min(axis=0)
-            return value, action
-
-        rngs = jax.random.split(jax.random.PRNGKey(0), 10)
-        obs = jax.numpy.array([0])
-        vv, aa = test_i(obs, rngs)
+    rng = jax.random.PRNGKey(0)
+    rngs = jax.random.split(rng, 10)
+    obs = jax.random.uniform(rng, (10, 1), minval=-1, maxval=1)
+    for o in obs:
+        vv, aa = test_i(o, rngs)
         for v, a in zip(vv, aa):
-            self.assertGreaterEqual(v, 1.0)  # very conservative, because minimum
-            self.assertAlmostEqual(a, 2.0, delta=0.1)
-
-    def test_env5(self):
-        env = TestEnv5Continuous()
-        td3 = TD3.create(env=env, **self.args)
-        ts, _ = self.train_fn(td3)
-        act = td3.make_act(ts)
-        q_fn = q_fn_from_critics(get_critics(ts))
-
-        @partial(jax.vmap, in_axes=(None, 0))
-        def test_i(obs, rng):
-            action = act(obs, rng)
-            action = jax.numpy.expand_dims(action, 0)
-            obs = jax.numpy.expand_dims(obs, 0)
-            action = jax.numpy.expand_dims(action, 1)
-
-            qs = q_fn(obs, action)
-            value = qs.min(axis=0)
-            return value, action.squeeze(1)
-
-        rng = jax.random.PRNGKey(0)
-        rngs = jax.random.split(rng, 10)
-        obs = jax.random.uniform(rng, (10, 1), minval=-1, maxval=1)
-        for o in obs:
-            vv, aa = test_i(o, rngs)
-            for v, a in zip(vv, aa):
-                self.assertAlmostEqual(v, 0.0, delta=0.1)
-                self.assertAlmostEqual(a, o, delta=0.1)
+            assert v == pytest.approx(0.0, abs=0.1)
+            assert a == pytest.approx(o, abs=0.1)

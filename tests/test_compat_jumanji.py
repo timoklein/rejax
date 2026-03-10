@@ -1,71 +1,49 @@
-import unittest
-
 import jax
 import jumanji
+import pytest
 from jumanji.specs import MultiDiscreteArray
 
 from rejax.compat.jumanji2gymnax import create_jumanji
 
 
-class TestJumanjiCompat(unittest.TestCase):
-    def test_create(self):
-        rng = jax.random.PRNGKey(0)
+JUMANJI_ENVS = [env for env in jumanji.registered_environments() if not env.startswith("Sokoban")]
 
-        for env in jumanji.registered_environments():
-            # This environment downloads some stuff from the internet.
-            # I'll just assume that it works if the others do...
-            if env.startswith("Sokoban"):
-                continue
 
-            with self.subTest(env=env):
-                if len(jumanji.make(env).action_spec.shape) > 1 or isinstance(
-                    jumanji.make(env).action_spec, MultiDiscreteArray
-                ):
-                    with self.assertRaises(NotImplementedError):
-                        create_jumanji(env)
-                    continue
+@pytest.mark.parametrize("env_name", JUMANJI_ENVS)
+def test_create(env_name):
+    rng = jax.random.PRNGKey(0)
 
-                env, params = create_jumanji(env)
+    if len(jumanji.make(env_name).action_spec.shape) > 1 or isinstance(jumanji.make(env_name).action_spec, MultiDiscreteArray):
+        with pytest.raises(NotImplementedError):
+            create_jumanji(env_name)
+        return
 
-                # JIT the reset and step functions
-                jitted_reset = jax.jit(env.reset)
-                jitted_step = jax.jit(env.step)
+    env, params = create_jumanji(env_name)
 
-                obs, state = jitted_reset(rng, params)
-                try:
-                    env.observation_space(params)
-                except Exception as e:
-                    self.fail(f"Failed to get obs space: {type(e).__name__}: {e}")
+    jitted_reset = jax.jit(env.reset)
+    jitted_step = jax.jit(env.step)
 
-                try:
-                    a = env.action_space(params).sample(rng)
-                except Exception as e:
-                    self.fail(f"Failed to sample action: {type(e).__name__}: {e}")
+    obs, state = jitted_reset(rng, params)
+    env.observation_space(params)
 
-                for _ in range(3):
-                    try:
-                        obs, state, _reward, _done, _info = jitted_step(rng, state, a, params)
-                    except Exception as e:
-                        self.fail(f"Failed to step: {type(e).__name__}: {e}")
+    a = env.action_space(params).sample(rng)
 
-                self.assertEqual(obs.dtype, env.observation_space(params).dtype)
-                self.assertEqual(obs.shape, env.observation_space(params).shape)
-                self.assertEqual(a.dtype, env.action_space(params).dtype)
-                self.assertEqual(a.shape, env.action_space(params).shape)
+    for _ in range(3):
+        obs, state, _reward, _done, _info = jitted_step(rng, state, a, params)
 
-    def test_jumanji_env_params(self):
-        """Test that environment parameters have max_steps_in_episode."""
-        for env_name in jumanji.registered_environments():
-            # Skip Sokoban as it downloads from the internet
-            if env_name.startswith("Sokoban"):
-                continue
+    assert obs.dtype == env.observation_space(params).dtype
+    assert obs.shape == env.observation_space(params).shape
+    assert a.dtype == env.action_space(params).dtype
+    assert a.shape == env.action_space(params).shape
 
-            with self.subTest(env=env_name):
-                try:
-                    _env, params = create_jumanji(env_name)
-                except NotImplementedError:
-                    self.skipTest(f"Environment {env_name} not created.")
 
-                # Test that params have max_steps_in_episode attribute
-                self.assertTrue(hasattr(params, "max_steps_in_episode"))
-                self.assertIsInstance(params.max_steps_in_episode, int)
+@pytest.mark.parametrize("env_name", JUMANJI_ENVS)
+def test_jumanji_env_params(env_name):
+    """Test that environment parameters have max_steps_in_episode."""
+    try:
+        _env, params = create_jumanji(env_name)
+    except NotImplementedError:
+        pytest.skip(f"Environment {env_name} not created.")
+
+    assert hasattr(params, "max_steps_in_episode")
+    assert isinstance(params.max_steps_in_episode, int)

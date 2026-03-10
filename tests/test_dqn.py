@@ -1,10 +1,7 @@
-import typing
-import unittest
-
 import jax
-from flax import nnx
+import pytest
 
-from rejax import DQN
+from rejax import DQNConfig, train_dqn
 
 from .environments import (
     TestEnv1Discrete,
@@ -15,84 +12,87 @@ from .environments import (
 )
 
 
-class TestEnvironmentsDQN(unittest.TestCase):
-    args: typing.ClassVar[dict] = {
-        "learning_rate": 0.0003,
-        "total_timesteps": 16384,
-        "eval_freq": 16384,
-        "skip_initial_evaluation": True,
-    }
+ARGS = {
+    "learning_rate": 0.0003,
+    "total_timesteps": 16384,
+    "eval_freq": 16384,
+    "skip_initial_evaluation": True,
+}
 
-    def train_fn(self, dqn):
-        return DQN.train(dqn, rng=jax.random.PRNGKey(0))
 
-    def _get_q_network(self, dqn, ts):
-        """Reconstruct Q-network from training state."""
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-        return q_optimizer.model
+def _train(env):
+    config = DQNConfig(**ARGS)
+    return train_dqn(config, jax.random.PRNGKey(0), env=env)
 
-    def test_env1(self):
-        env = TestEnv1Discrete()
-        dqn = DQN.create(env=env, **self.args)
-        ts, _ = self.train_fn(dqn)
-        q_network = self._get_q_network(dqn, ts)
-        value = q_network(jax.numpy.array([0]))
-        self.assertAlmostEqual(value, 1.0, delta=0.1)
 
-    def test_env2(self):
-        env = TestEnv2Discrete()
-        dqn = DQN.create(env=env, **self.args)
-        ts, _ = self.train_fn(dqn)
-        q_network = self._get_q_network(dqn, ts)
+def _get_q_network(state):
+    return state["q_optimizer"].model
 
-        obs = jax.numpy.array([[-1], [1]])
-        rew = obs
-        value = q_network(obs)
 
-        for v, r in zip(value, rew):
-            self.assertAlmostEqual(v, r, delta=0.1)
+def _make_act(state, config=None):
+    from rejax.algos.dqn import _make_act
 
-    def test_env3(self):
-        env = TestEnv3Discrete()
-        dqn = DQN.create(env=env, **self.args)
-        ts, _ = self.train_fn(dqn)
-        q_network = self._get_q_network(dqn, ts)
+    cfg = config or DQNConfig(**ARGS)
+    return _make_act(state["q_optimizer"].model, cfg, state.get("obs_rms_state"))
 
-        obs = jax.numpy.array([[-1], [1]])
-        rew = [1 * dqn.gamma, 1]
-        value = q_network(obs)
 
-        for v, r in zip(value, rew):
-            self.assertAlmostEqual(v, r, delta=0.1)
+def test_env1():
+    state, _ = _train(TestEnv1Discrete())
+    q_network = _get_q_network(state)
+    value = q_network(jax.numpy.array([0]))
+    assert value == pytest.approx(1.0, abs=0.1)
 
-    def test_env4(self):
-        env = TestEnv4Discrete()
-        dqn = DQN.create(env=env, **self.args)
-        ts, _ = self.train_fn(dqn)
-        q_network = self._get_q_network(dqn, ts)
 
-        best_action = 1
-        value = q_network(jax.numpy.array([0]))
-        self.assertEqual(value.argmax(), best_action)
+def test_env2():
+    state, _ = _train(TestEnv2Discrete())
+    q_network = _get_q_network(state)
 
-        act = dqn.make_act(ts)
-        rngs = jax.random.split(jax.random.PRNGKey(0), 10)
-        actions = jax.vmap(act, in_axes=(None, 0))(jax.numpy.array([0]), rngs)
+    obs = jax.numpy.array([[-1], [1]])
+    rew = obs
+    value = q_network(obs)
 
-        for a in actions:
-            self.assertAlmostEqual(a, best_action, delta=0.1)
+    for v, r in zip(value, rew):
+        assert v == pytest.approx(r, abs=0.1)
 
-    def test_env5(self):
-        env = TestEnv5Discrete()
-        dqn = DQN.create(env=env, **self.args)
-        ts, _ = self.train_fn(dqn)
 
-        rng = jax.random.PRNGKey(0)
-        obs = 2 * jax.random.bernoulli(rng, shape=(10, 1)) - 1
+def test_env3():
+    state, _ = _train(TestEnv3Discrete())
+    q_network = _get_q_network(state)
 
-        act = dqn.make_act(ts)
-        rngs = jax.random.split(rng, 10)
-        actions = jax.vmap(act)(obs, rngs)
+    obs = jax.numpy.array([[-1], [1]])
+    gamma = DQNConfig(**ARGS).gamma
+    rew = [1 * gamma, 1]
+    value = q_network(obs)
 
-        for o, a in zip(obs, actions):
-            self.assertEqual(a > 0.5, o > 0)
+    for v, r in zip(value, rew):
+        assert v == pytest.approx(r, abs=0.1)
+
+
+def test_env4():
+    state, _ = _train(TestEnv4Discrete())
+    q_network = _get_q_network(state)
+
+    best_action = 1
+    value = q_network(jax.numpy.array([0]))
+    assert value.argmax() == best_action
+
+    act = _make_act(state)
+    rngs = jax.random.split(jax.random.PRNGKey(0), 10)
+    actions = jax.vmap(act, in_axes=(None, 0))(jax.numpy.array([0]), rngs)
+
+    for a in actions:
+        assert a == pytest.approx(best_action, abs=0.1)
+
+
+def test_env5():
+    state, _ = _train(TestEnv5Discrete())
+
+    rng = jax.random.PRNGKey(0)
+    obs = 2 * jax.random.bernoulli(rng, shape=(10, 1)) - 1
+
+    act = _make_act(state)
+    rngs = jax.random.split(rng, 10)
+    actions = jax.vmap(act)(obs, rngs)
+
+    for o, a in zip(obs, actions):
+        assert (a > 0.5) == (o > 0)

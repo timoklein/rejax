@@ -1,6 +1,6 @@
 from .algorithm import Algorithm
-from .dqn import DQN
-from .iqn import IQN
+from .dqn import train_dqn
+from .iqn import train_iqn
 from .mixins import (
     EpsilonGreedyMixin,
     NormalizeObservationsMixin,
@@ -8,23 +8,23 @@ from .mixins import (
     TargetNetworkMixin,
     VectorizedEnvMixin,
 )
-from .ppo import PPO
-from .pqn import PQN
-from .sac import SAC
-from .td3 import TD3
+from .ppo import train_ppo
+from .pqn import train_pqn
+from .sac import train_sac
+from .td3 import train_td3
 
 
 __all__ = [
-    "DQN",
-    "IQN",
-    "PPO",
-    "PQN",
-    "SAC",
-    "TD3",
     "Algorithm",
     "EpsilonGreedyMixin",
     "NormalizeObservationsMixin",
     "ReplayBufferMixin",
     "TargetNetworkMixin",
     "VectorizedEnvMixin",
+    "train_dqn",
+    "train_iqn",
+    "train_ppo",
+    "train_pqn",
+    "train_sac",
+    "train_td3",
 ]

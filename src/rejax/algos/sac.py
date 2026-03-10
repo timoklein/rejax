@@ -1,361 +1,397 @@
-"""Soft Actor-Critic (SAC)."""
+"""Soft Actor-Critic (SAC) — standalone training function."""
 
-from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import chex
 import jax
 import numpy as np
 import optax
-from flax import nnx, struct
-from gymnax.environments.environment import Environment
+from flax import nnx
 from jax import numpy as jnp
 
-from rejax.algos.algorithm import Algorithm, register_init
-from rejax.algos.mixins import (
-    NormalizeObservationsMixin,
-    NormalizeRewardsMixin,
-    ReplayBufferMixin,
-    TargetNetworkMixin,
+from rejax.algos.utils import (
+    FloatObsWrapper,
+    RewardRMSState,
+    RMSState,
+    normalize_obs,
+    normalize_rew,
+    update_rew_rms,
+    update_rms,
 )
-from rejax.buffers import Minibatch
+from rejax.buffers import Minibatch, ReplayBuffer
+from rejax.compat import create
+from rejax.evaluate import evaluate
 from rejax.networks import QNetwork, SquashedGaussianPolicy
 
 
-class SAC(
-    ReplayBufferMixin,
-    NormalizeObservationsMixin,
-    NormalizeRewardsMixin,
-    TargetNetworkMixin,
-    Algorithm,
-):
-    """Soft Actor-Critic algorithm.
+NUM_CRITICS = 2
 
-    SAC is an off-policy algorithm that learns:
-    - A stochastic policy (actor) maximizing expected return + entropy
-    - Twin Q-networks (critics) for value estimation
-    - An adaptive temperature parameter (alpha) for entropy regularization
+
+class SACCarry(NamedTuple):
+    """Non-module carry state for SAC training."""
+
+    rng: chex.PRNGKey
+    env_state: Any
+    last_obs: chex.Array
+    last_done: chex.Array
+    global_step: int
+    replay_buffer: ReplayBuffer
+    obs_rms: RMSState
+    rew_rms: RewardRMSState
+    log_alpha: chex.Array
+    alpha_opt_state: Any
+
+
+def _create_env(config):
+    if isinstance(config.env, str):
+        env, env_params = create(config.env)
+    else:
+        env = config.env
+        env_params = getattr(config, "env_params", None) or env.default_params
+    if config.normalize_observations:
+        env = FloatObsWrapper(env)
+    return env, env_params
+
+
+def _create_networks(config, env, env_params, rng):
+    """Create actor, twin critics, and twin critic targets."""
+    obs_space = env.observation_space(env_params)
+    action_space = env.action_space(env_params)
+    in_features = int(np.prod(obs_space.shape))
+    action_dim = int(np.prod(action_space.shape))
+    action_range = (float(action_space.low), float(action_space.high))
+
+    agent_kwargs = {}
+    if hasattr(config, "agent_kwargs") and config.agent_kwargs is not None:
+        import dataclasses
+
+        agent_kwargs = dataclasses.asdict(config.agent_kwargs)
+
+    activation = agent_kwargs.pop("activation", "swish")
+    agent_kwargs["activation"] = getattr(nnx, activation)
+    hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
+    agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
+    log_std_range = agent_kwargs.pop("log_std_range", (-10, 2))
+
+    actor_kwargs = {
+        "in_features": in_features,
+        "action_dim": action_dim,
+        "action_range": action_range,
+        "log_std_range": log_std_range,
+        **agent_kwargs,
+    }
+    critic_kwargs = {
+        "obs_dim": in_features,
+        "action_dim": action_dim,
+        **agent_kwargs,
+    }
+
+    tx = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adam(learning_rate=config.learning_rate),
+    )
+
+    rng, rng_actor = jax.random.split(rng)
+    actor = SquashedGaussianPolicy(**actor_kwargs, rngs=nnx.Rngs(rng_actor))
+    actor_optimizer = nnx.Optimizer(actor, tx)
+
+    rng, rng_critics = jax.random.split(rng)
+    rng_critics = jax.random.split(rng_critics, NUM_CRITICS)
+    critic_opts = []
+    for i in range(NUM_CRITICS):
+        critic = QNetwork(**critic_kwargs, rngs=nnx.Rngs(rng_critics[i]))
+        critic_opts.append(nnx.Optimizer(critic, tx))
+
+    rng, rng_targets = jax.random.split(rng)
+    rng_targets = jax.random.split(rng_targets, NUM_CRITICS)
+    critic_targets = []
+    for i in range(NUM_CRITICS):
+        critic = QNetwork(**critic_kwargs, rngs=nnx.Rngs(rng_targets[i]))
+        # Copy params from online critics
+        online_params = nnx.state(critic_opts[i].model, nnx.Param)
+        nnx.update(critic, online_params)
+        critic_targets.append(critic)
+
+    return actor_optimizer, critic_opts, critic_targets, action_dim
+
+
+def _make_act(actor, config, obs_rms=None):
+    """Build eval policy closure."""
+
+    def act(obs, rng):
+        if config.normalize_observations and obs_rms is not None:
+            obs = normalize_obs(obs_rms, obs)
+        obs = jnp.expand_dims(obs, 0)
+        action = actor.act(obs, rng)
+        return jnp.squeeze(action)
+
+    return act
+
+
+def train_sac(config, rng, *, env=None, env_params=None):
+    """Train SAC. Designed to be JIT-able and vmap-able over rng.
+
+    Args:
+        config: SACConfig dataclass
+        rng: PRNG key
+        env: Optional environment (overrides config.env)
+        env_params: Optional env params
+
+    Returns:
+        (state_dict, eval_metrics) where state_dict contains trained NNX modules
     """
+    # --- Setup ---
+    if env is None:
+        env, env_params = _create_env(config)
+    else:
+        if env_params is None:
+            env_params = env.default_params
+        if config.normalize_observations:
+            env = FloatObsWrapper(env)
 
-    # Network module types (stored as fields for type info, not pytree nodes)
-    actor_cls: type[nnx.Module] = struct.field(pytree_node=False, default=None)
-    critic_cls: type[nnx.Module] = struct.field(pytree_node=False, default=None)
+    num_envs = config.num_envs
+    action_space = env.action_space(env_params)
+    obs_space = env.observation_space(env_params)
+    max_steps = env_params.max_steps_in_episode
 
-    # Network creation kwargs
-    actor_kwargs: dict = struct.field(pytree_node=False, default=None)
-    critic_kwargs: dict = struct.field(pytree_node=False, default=None)
+    vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
+    vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
-    # SAC hyperparameters
-    num_critics: int = struct.field(pytree_node=False, default=2)
-    num_epochs: int = struct.field(pytree_node=False, default=1)
-    target_entropy_ratio: chex.Scalar = struct.field(pytree_node=False, default=None)
-    target_entropy: chex.Scalar = struct.field(pytree_node=False, default=None)
+    # Create networks
+    rng, rng_net = jax.random.split(rng)
+    actor_optimizer, critic_opts, critic_targets, action_dim = _create_networks(config, env, env_params, rng_net)
 
-    def make_act(self, ts: Any) -> Callable:
-        """Create an action selection function for evaluation."""
-        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
-        actor = actor_optimizer.model
+    # Compute target entropy
+    target_entropy = float(-action_dim)
 
-        def act(obs: jax.Array, rng: chex.PRNGKey) -> jax.Array:
-            if self.normalize_observations:
-                obs = self.normalize_obs(ts.obs_rms_state, obs)
+    # Alpha optimizer (pure optax, not nnx.Optimizer since it's a scalar)
+    alpha_tx = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adam(learning_rate=config.learning_rate),
+    )
+    log_alpha = jnp.array(0.0)
+    alpha_opt_state = alpha_tx.init(log_alpha)
 
-            obs = jnp.expand_dims(obs, 0)
-            action = actor.act(obs, rng)
-            return jnp.squeeze(action)
+    # Init env
+    rng, rng_env = jax.random.split(rng)
+    obs, env_state = vmap_reset(jax.random.split(rng_env, num_envs), env_params)
 
-        return act
+    # Init normalization
+    obs_rms = RMSState.create(obs_space.shape)
+    rew_rms = RewardRMSState.create(num_envs)
 
-    @classmethod
-    def create_agent(cls, config: dict, env: Environment, env_params: Any) -> dict:
-        """Create actor and critic network configurations."""
-        obs_space = env.observation_space(env_params)
-        action_space = env.action_space(env_params)
+    # Init replay buffer
+    buf = ReplayBuffer.empty(config.buffer_size, obs_space, action_space)
 
-        obs_shape = obs_space.shape
-        in_features = int(np.prod(obs_shape))
+    carry = SACCarry(
+        rng=rng,
+        env_state=env_state,
+        last_obs=obs,
+        last_done=jnp.zeros(num_envs, dtype=bool),
+        global_step=0,
+        replay_buffer=buf,
+        obs_rms=obs_rms,
+        rew_rms=rew_rms,
+        log_alpha=log_alpha,
+        alpha_opt_state=alpha_opt_state,
+    )
 
-        agent_kwargs = config.pop("agent_kwargs", {})
-        actor_kwargs = config.pop("actor_kwargs", agent_kwargs.copy())
-        critic_kwargs = config.pop("critic_kwargs", agent_kwargs.copy())
+    # --- Collect transitions ---
+    def collect_transitions(carry, actor):
+        rng, rng_action = jax.random.split(carry.rng)
+        carry = carry._replace(rng=rng)
 
-        # Actor configuration
-        activation = actor_kwargs.pop("activation", "swish")
-        actor_kwargs["activation"] = getattr(nnx, activation)
-        hidden_layer_sizes = actor_kwargs.pop("hidden_layer_sizes", (64, 64))
-        actor_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
-        log_std_range = actor_kwargs.pop("log_std_range", (-10, 2))
-
-        action_range = (float(action_space.low), float(action_space.high))
-        action_dim = int(np.prod(action_space.shape))
-
-        actor_cls = SquashedGaussianPolicy
-        actor_kwargs = {
-            "in_features": in_features,
-            "action_dim": action_dim,
-            "action_range": action_range,
-            "log_std_range": log_std_range,
-            **actor_kwargs,
-        }
-
-        # Critic configuration
-        activation = critic_kwargs.pop("activation", "swish")
-        critic_kwargs["activation"] = getattr(nnx, activation)
-        hidden_layer_sizes = critic_kwargs.pop("hidden_layer_sizes", (64, 64))
-        critic_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
-
-        critic_cls = QNetwork
-        critic_kwargs = {
-            "obs_dim": in_features,
-            "action_dim": action_dim,
-            **critic_kwargs,
-        }
-
-        if "target_entropy" not in config or config.get("target_entropy") is None:
-            config["target_entropy"] = float(-action_dim)
-
-        return {
-            "actor_cls": actor_cls,
-            "actor_kwargs": actor_kwargs,
-            "critic_cls": critic_cls,
-            "critic_kwargs": critic_kwargs,
-        }
-
-    @register_init
-    def initialize_network_params(self, rng: chex.PRNGKey) -> dict:
-        """Initialize actor, critics, and alpha parameter with optimizers."""
-        rng, rng_actor, rng_critic, rng_alpha = jax.random.split(rng, 4)
-
-        actor = self.actor_cls(**self.actor_kwargs, rngs=nnx.Rngs(rng_actor))
-
-        tx = optax.chain(
-            optax.clip_by_global_norm(self.max_grad_norm),
-            optax.adam(learning_rate=self.learning_rate),
-        )
-
-        actor_optimizer = nnx.Optimizer(actor, tx)
-
-        rng_critic = jax.random.split(rng_critic, self.num_critics)
-        critics_list = []
-        for i in range(self.num_critics):
-            critic = self.critic_cls(**self.critic_kwargs, rngs=nnx.Rngs(rng_critic[i]))
-            critics_list.append(critic)
-
-        critic_optimizers = [nnx.Optimizer(critic, tx) for critic in critics_list]
-
-        critic_graphdefs_states = [nnx.split(opt) for opt in critic_optimizers]
-        critic_graphdef = critic_graphdefs_states[0][0]
-        critic_states = [gs[1] for gs in critic_graphdefs_states]
-        critic_state = jax.tree.map(lambda *args: jnp.stack(args), *critic_states)
-
-        actor_graphdef, actor_state = nnx.split(actor_optimizer)
-
-        critic_target_state = critic_state
-
-        log_alpha = jnp.array(0.0)
-        alpha_opt_state = tx.init(log_alpha)
-
-        return {
-            "actor_graphdef": actor_graphdef,
-            "actor_state": actor_state,
-            "critic_graphdef": critic_graphdef,
-            "critic_state": critic_state,
-            "critic_target_state": critic_target_state,
-            "log_alpha": log_alpha,
-            "alpha_opt_state": alpha_opt_state,
-        }
-
-    def _unstack_and_merge_critics(self, graphdef, stacked_state):
-        """Unstack stacked critic states and merge each into a live module."""
-        states = [jax.tree.map(lambda x: x[i], stacked_state) for i in range(self.num_critics)]
-        return [nnx.merge(graphdef, s) for s in states]
-
-    def _split_and_stack_critics(self, critics):
-        """Split live critic modules and stack their states."""
-        states = [nnx.split(c)[1] for c in critics]
-        return jax.tree.map(lambda *args: jnp.stack(args), *states)
-
-    def train_iteration(self, ts: Any) -> Any:
-        """Run one training iteration."""
-        old_global_step = ts.global_step
-
-        # Merge once at top
-        actor_optimizer = nnx.merge(ts.actor_graphdef, ts.actor_state)
-        actor = actor_optimizer.model
-        critic_opts = self._unstack_and_merge_critics(ts.critic_graphdef, ts.critic_state)
-        critic_targets = self._unstack_and_merge_critics(ts.critic_graphdef, ts.critic_target_state)
-
-        # Collect transitions
-        ts, transitions = self.collect_transitions(ts, actor)
-        ts = ts.replace(replay_buffer=ts.replay_buffer.extend(transitions))
-
-        # Perform updates
-        def update_iteration(_, state):
-            ts, actor_opt, c_opts, c_tgts = state
-            rng, rng_sample = jax.random.split(ts.rng)
-            ts = ts.replace(rng=rng)
-            minibatch = ts.replay_buffer.sample(self.batch_size, rng_sample)
-            if self.normalize_observations:
-                minibatch = minibatch._replace(
-                    obs=self.normalize_obs(ts.obs_rms_state, minibatch.obs),
-                    next_obs=self.normalize_obs(ts.obs_rms_state, minibatch.next_obs),
-                )
-            if self.normalize_rewards:
-                minibatch = minibatch._replace(reward=self.normalize_rew(ts.rew_rms_state, minibatch.reward))
-
-            ts = self.update(ts, minibatch, actor_opt, c_opts, c_tgts)
-            return (ts, actor_opt, c_opts, c_tgts)
-
-        def do_updates(ts, actor_opt, c_opts, c_tgts):
-            return nnx.fori_loop(0, self.num_epochs, update_iteration, (ts, actor_opt, c_opts, c_tgts))
-
-        def no_updates(ts, actor_opt, c_opts, c_tgts):
-            return (ts, actor_opt, c_opts, c_tgts)
-
-        start_training = ts.global_step > self.fill_buffer
-        ts, actor_optimizer, critic_opts, critic_targets = nnx.cond(
-            start_training, do_updates, no_updates, ts, actor_optimizer, critic_opts, critic_targets
-        )
-
-        # Update target networks
-        if self.target_update_freq == 1:
-            for i in range(self.num_critics):
-                online_params = nnx.state(critic_opts[i].model, nnx.Param)
-                target_params = nnx.state(critic_targets[i].model, nnx.Param)
-                updated_params = jax.tree.map(
-                    lambda online, target: self.polyak * target + (1 - self.polyak) * online,
-                    online_params,
-                    target_params,
-                )
-                nnx.update(critic_targets[i].model, updated_params)
-        else:
-            update_target_params = ts.global_step % self.target_update_freq <= old_global_step % self.target_update_freq
-
-            def update_targets(c_tgts):
-                for i in range(self.num_critics):
-                    online_params = nnx.state(critic_opts[i].model, nnx.Param)
-                    nnx.update(c_tgts[i].model, online_params)
-                return c_tgts
-
-            def no_update_targets(c_tgts):
-                return c_tgts
-
-            critic_targets = nnx.cond(update_target_params, update_targets, no_update_targets, critic_targets)
-
-        # Split once at bottom
-        _, actor_state = nnx.split(actor_optimizer)
-        critic_state = self._split_and_stack_critics(critic_opts)
-        critic_target_state = self._split_and_stack_critics(critic_targets)
-        return ts.replace(actor_state=actor_state, critic_state=critic_state, critic_target_state=critic_target_state)
-
-    def collect_transitions(self, ts: Any, actor: nnx.Module) -> tuple:
-        """Collect transitions from the environment."""
-        rng, rng_action = jax.random.split(ts.rng)
-        ts = ts.replace(rng=rng)
-
-        if self.normalize_observations:
-            last_obs = self.normalize_obs(ts.obs_rms_state, ts.last_obs)
-        else:
-            last_obs = ts.last_obs
+        last_obs = carry.last_obs
+        if config.normalize_observations:
+            last_obs = normalize_obs(carry.obs_rms, last_obs)
 
         actions = actor.act(last_obs, rng_action)
 
-        rng, rng_steps = jax.random.split(ts.rng)
-        ts = ts.replace(rng=rng)
-        rng_steps = jax.random.split(rng_steps, self.num_envs)
-        next_obs, env_state, rewards, dones, _ = self.vmap_step(rng_steps, ts.env_state, actions, self.env_params)
+        rng, rng_steps = jax.random.split(carry.rng)
+        carry = carry._replace(rng=rng)
+        rng_steps = jax.random.split(rng_steps, num_envs)
+        next_obs, new_env_state, rewards, dones, _ = vmap_step(rng_steps, carry.env_state, actions, env_params)
 
-        if self.normalize_observations:
-            ts = ts.replace(obs_rms_state=self.update_obs_rms(ts.obs_rms_state, next_obs))
-        if self.normalize_rewards:
-            ts = ts.replace(rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones))
+        obs_rms = carry.obs_rms
+        rew_rms = carry.rew_rms
+        if config.normalize_observations:
+            obs_rms = update_rms(obs_rms, next_obs)
+        if config.normalize_rewards:
+            rew_rms = update_rew_rms(rew_rms, rewards, dones, config.gamma)
 
-        minibatch = Minibatch(
-            obs=ts.last_obs,
-            action=actions,
-            reward=rewards,
-            next_obs=next_obs,
-            done=dones,
-        )
-        ts = ts.replace(
+        mb = Minibatch(obs=carry.last_obs, action=actions, reward=rewards, next_obs=next_obs, done=dones)
+        carry = carry._replace(
             last_obs=next_obs,
-            env_state=env_state,
-            global_step=ts.global_step + self.num_envs,
+            env_state=new_env_state,
+            global_step=carry.global_step + num_envs,
+            obs_rms=obs_rms,
+            rew_rms=rew_rms,
         )
-        return ts, minibatch
+        return carry, mb
 
-    def update(
-        self, ts: Any, minibatch: Minibatch, actor_optimizer: nnx.Optimizer, critic_opts: list, critic_targets: list
-    ) -> Any:
-        """Update actor, critics, and alpha. Mutates optimizers in-place."""
-        ts, logprob = self.update_actor(ts, minibatch, actor_optimizer, critic_opts)
-        self.update_critic(ts, minibatch, actor_optimizer.model, critic_opts, critic_targets)
-        ts = self.update_alpha(ts, logprob)
-        return ts
+    # --- Update actor ---
+    def update_actor(carry, mb, actor_optimizer, critic_opts):
+        rng, action_rng = jax.random.split(carry.rng)
+        carry = carry._replace(rng=rng)
 
-    def update_actor(self, ts: Any, minibatch: Minibatch, actor_optimizer: nnx.Optimizer, critic_opts: list) -> tuple:
-        """Update actor network. Mutates actor_optimizer in-place."""
-        rng, action_rng = jax.random.split(ts.rng)
-        ts = ts.replace(rng=rng)
-
-        alpha = jnp.exp(ts.log_alpha)
+        alpha = jnp.exp(carry.log_alpha)
         actor = actor_optimizer.model
         critics = [opt.model for opt in critic_opts]
 
-        def actor_loss_fn(actor_model: nnx.Module) -> tuple:
-            actions, logprobs = actor_model.action_log_prob(minibatch.obs, action_rng)
-            qs = jnp.stack([critic(minibatch.obs, actions) for critic in critics])
+        def actor_loss_fn(actor_model):
+            actions, logprobs = actor_model.action_log_prob(mb.obs, action_rng)
+            qs = jnp.stack([critic(mb.obs, actions) for critic in critics])
             q_value = jnp.min(qs, axis=0)
             loss = (alpha * logprobs - q_value).mean()
             return loss, logprobs
 
-        (loss, logprobs), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(actor)
+        (_loss, logprobs), grads = nnx.value_and_grad(actor_loss_fn, has_aux=True)(actor)
         actor_optimizer.update(grads)
-        return ts, logprobs
+        return carry, logprobs
 
-    def update_critic(self, ts: Any, minibatch: Minibatch, actor: nnx.Module, critic_opts: list, critic_targets: list) -> None:
-        """Update critic networks. Mutates critic_opts in-place."""
-        rng, action_rng = jax.random.split(ts.rng)
-        ts = ts.replace(rng=rng)
+    # --- Update critics ---
+    def update_critics(carry, mb, actor, critic_opts, critic_targets):
+        rng, action_rng = jax.random.split(carry.rng)
+        carry = carry._replace(rng=rng)
 
-        alpha = jnp.exp(ts.log_alpha)
+        alpha = jnp.exp(carry.log_alpha)
 
-        next_actions, next_logprobs = actor.action_log_prob(minibatch.next_obs, action_rng)
+        next_actions, next_logprobs = actor.action_log_prob(mb.next_obs, action_rng)
 
-        # Compute target Q-values using target critics
-        target_critics = [opt.model for opt in critic_targets]
-        qs_target = jnp.stack([critic(minibatch.next_obs, next_actions) for critic in target_critics])
+        qs_target = jnp.stack([critic(mb.next_obs, next_actions) for critic in critic_targets])
         q_target = jnp.min(qs_target, axis=0)
         q_target = q_target - alpha * next_logprobs
-        target = minibatch.reward + (1 - minibatch.done) * self.gamma * q_target
+        targets = mb.reward + (1 - mb.done) * config.gamma * q_target
 
-        # Update each critic
         for critic_opt in critic_opts:
             critic = critic_opt.model
 
-            def critic_loss_fn(critic_model: nnx.Module) -> jax.Array:
-                q = critic_model(minibatch.obs, minibatch.action)
-                return optax.l2_loss(q, target).mean()
+            def critic_loss_fn(critic_model):
+                q = critic_model(mb.obs, mb.action)
+                return optax.l2_loss(q, targets).mean()
 
-            loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
+            _loss, grads = nnx.value_and_grad(critic_loss_fn)(critic)
             critic_opt.update(grads)
 
-    def update_alpha(self, ts: Any, logprob: jax.Array) -> Any:
-        """Update temperature parameter (alpha)."""
-
-        def alpha_loss_fn(log_alpha: jax.Array) -> jax.Array:
-            alpha = jnp.exp(log_alpha)
-            loss = -alpha * (logprob + self.target_entropy)
+    # --- Update alpha ---
+    def update_alpha(carry, logprob):
+        def alpha_loss_fn(log_alpha_val):
+            alpha = jnp.exp(log_alpha_val)
+            loss = -alpha * (logprob + target_entropy)
             return loss.mean()
 
-        loss, grads = jax.value_and_grad(alpha_loss_fn)(ts.log_alpha)
+        _loss, grads = jax.value_and_grad(alpha_loss_fn)(carry.log_alpha)
+        updates, new_alpha_opt_state = alpha_tx.update(grads, carry.alpha_opt_state, carry.log_alpha)
+        new_log_alpha = optax.apply_updates(carry.log_alpha, updates)
+        return carry._replace(log_alpha=new_log_alpha, alpha_opt_state=new_alpha_opt_state)
 
-        tx = optax.chain(
-            optax.clip_by_global_norm(self.max_grad_norm),
-            optax.adam(learning_rate=self.learning_rate),
+    # --- Train iteration ---
+    def train_iteration(carry, actor_optimizer, critic_opts, critic_targets):
+        start_training = carry.global_step > config.fill_buffer
+        old_global_step = carry.global_step
+
+        carry, batch = collect_transitions(carry, actor_optimizer.model)
+        carry = carry._replace(replay_buffer=carry.replay_buffer.extend(batch))
+
+        def update_iteration(_, state):
+            carry, actor_opt, c_opts, c_tgts = state
+            rng, rng_sample = jax.random.split(carry.rng)
+            carry = carry._replace(rng=rng)
+            minibatch = carry.replay_buffer.sample(config.batch_size, rng_sample)
+            if config.normalize_observations:
+                minibatch = minibatch._replace(
+                    obs=normalize_obs(carry.obs_rms, minibatch.obs),
+                    next_obs=normalize_obs(carry.obs_rms, minibatch.next_obs),
+                )
+            if config.normalize_rewards:
+                minibatch = minibatch._replace(reward=normalize_rew(carry.rew_rms, minibatch.reward))
+
+            carry, logprob = update_actor(carry, minibatch, actor_opt, c_opts)
+            update_critics(carry, minibatch, actor_opt.model, c_opts, c_tgts)
+            carry = update_alpha(carry, logprob)
+            return (carry, actor_opt, c_opts, c_tgts)
+
+        def do_updates(carry, actor_opt, c_opts, c_tgts):
+            return nnx.fori_loop(0, config.num_epochs, update_iteration, (carry, actor_opt, c_opts, c_tgts))
+
+        def no_updates(carry, actor_opt, c_opts, c_tgts):
+            return (carry, actor_opt, c_opts, c_tgts)
+
+        carry, actor_optimizer, critic_opts, critic_targets = nnx.cond(
+            start_training, do_updates, no_updates, carry, actor_optimizer, critic_opts, critic_targets
         )
-        updates, alpha_opt_state = tx.update(grads, ts.alpha_opt_state, ts.log_alpha)
-        log_alpha = optax.apply_updates(ts.log_alpha, updates)
 
-        ts = ts.replace(log_alpha=log_alpha, alpha_opt_state=alpha_opt_state)
-        return ts
+        # Update target networks
+        if config.target_update_freq == 1:
+            for i in range(NUM_CRITICS):
+                online_params = nnx.state(critic_opts[i].model, nnx.Param)
+                target_params = nnx.state(critic_targets[i], nnx.Param)
+                updated = jax.tree.map(
+                    lambda o, t: config.polyak * t + (1 - config.polyak) * o,
+                    online_params,
+                    target_params,
+                )
+                nnx.update(critic_targets[i], updated)
+        else:
+            do_update = carry.global_step % config.target_update_freq <= old_global_step % config.target_update_freq
+
+            def _update(c_tgts):
+                for i in range(NUM_CRITICS):
+                    online_params = nnx.state(critic_opts[i].model, nnx.Param)
+                    nnx.update(c_tgts[i], online_params)
+                return c_tgts
+
+            def _no_update(c_tgts):
+                return c_tgts
+
+            critic_targets = nnx.cond(do_update, _update, _no_update, critic_targets)
+
+        return carry, actor_optimizer, critic_opts, critic_targets
+
+    # --- Eval callback ---
+    def eval_callback(carry, actor_optimizer):
+        act_fn = _make_act(actor_optimizer.model, config, carry.obs_rms)
+        return evaluate(act_fn, carry.rng, env, env_params, 128, max_steps)
+
+    # --- Outer training loop ---
+    steps_per_iter = int(np.ceil(config.eval_freq / num_envs))
+    num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
+
+    if not config.skip_initial_evaluation:
+        initial_eval = eval_callback(carry, actor_optimizer)
+
+    def eval_iteration(state, _):
+        carry, actor_opt, c_opts, c_tgts = state
+
+        def train_body(_, s):
+            return train_iteration(*s)
+
+        carry, actor_opt, c_opts, c_tgts = nnx.fori_loop(0, steps_per_iter, train_body, (carry, actor_opt, c_opts, c_tgts))
+        metrics = eval_callback(carry, actor_opt)
+        return (carry, actor_opt, c_opts, c_tgts), metrics
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def scan_eval(state, _dummy):
+        return eval_iteration(state, _dummy)
+
+    (carry, actor_optimizer, critic_opts, critic_targets), all_metrics = scan_eval(
+        (carry, actor_optimizer, critic_opts, critic_targets), jnp.zeros(num_evals)
+    )
+
+    if not config.skip_initial_evaluation:
+        all_metrics = jax.tree.map(
+            lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
+            initial_eval,
+            all_metrics,
+        )
+
+    state = {
+        "actor_optimizer": actor_optimizer,
+        "critic_optimizers": critic_opts,
+        "critic_targets": critic_targets,
+        "obs_rms_state": carry.obs_rms,
+        "rew_rms_state": carry.rew_rms,
+        "log_alpha": carry.log_alpha,
+        "global_step": carry.global_step,
+    }
+    return state, all_metrics

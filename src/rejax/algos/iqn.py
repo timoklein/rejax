@@ -1,365 +1,312 @@
-"""Implicit Quantile Network (IQN)."""
+"""Implicit Quantile Network (IQN) — standalone training function."""
 
-from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import chex
 import distrax
+import gymnax
 import jax
 import numpy as np
 import optax
-from flax import nnx, struct
-from gymnax.environments.environment import Environment
+from flax import nnx
 from jax import numpy as jnp
+from optax import linear_schedule
 
-from rejax.algos.algorithm import Algorithm, register_init
-from rejax.algos.mixins import (
-    EpsilonGreedyMixin,
-    NormalizeObservationsMixin,
-    NormalizeRewardsMixin,
-    ReplayBufferMixin,
-    TargetNetworkMixin,
+from rejax.algos.utils import (
+    FloatObsWrapper,
+    RewardRMSState,
+    RMSState,
+    normalize_obs,
+    normalize_rew,
+    update_rew_rms,
+    update_rms,
 )
-from rejax.buffers import Minibatch
+from rejax.buffers import Minibatch, ReplayBuffer
+from rejax.compat import create
+from rejax.evaluate import evaluate
 from rejax.networks import ImplicitQuantileNetwork
 
 
-def EpsilonGreedyPolicy(iqn: type[nnx.Module]) -> type[nnx.Module]:  # noqa: N802
-    """Create an epsilon-greedy policy wrapper for IQN.
+class IQNCarry(NamedTuple):
+    """Non-module carry state for IQN training."""
 
-    Args:
-        iqn: The IQN network class to wrap
-
-    Returns:
-        Wrapped network class with epsilon-greedy action selection
-    """
-
-    class EpsilonGreedyPolicy(iqn):
-        def _action_dist(self, obs: jax.Array, rng: chex.PRNGKey, epsilon: float):
-            q = self.q(obs, rng)
-            return distrax.EpsilonGreedy(q, epsilon=epsilon)
-
-        def act(self, obs: jax.Array, rng: chex.PRNGKey, epsilon: float):
-            rng_tau, rng_epsilon = jax.random.split(rng)
-            action_dist = self._action_dist(obs, rng_tau, epsilon)
-            action = action_dist.sample(seed=rng_epsilon)
-            return action
-
-    return EpsilonGreedyPolicy
+    rng: chex.PRNGKey
+    env_state: Any
+    last_obs: chex.Array
+    last_done: chex.Array
+    global_step: int
+    replay_buffer: ReplayBuffer
+    obs_rms: RMSState
+    rew_rms: RewardRMSState
 
 
-class IQN(
-    EpsilonGreedyMixin,
-    ReplayBufferMixin,
-    TargetNetworkMixin,
-    NormalizeObservationsMixin,
-    NormalizeRewardsMixin,
-    Algorithm,
-):
-    """Implicit Quantile Network algorithm.
+def _create_env(config):
+    if isinstance(config.env, str):
+        env, env_params = create(config.env)
+    else:
+        env = config.env
+        env_params = getattr(config, "env_params", None) or env.default_params
+    if config.normalize_observations:
+        env = FloatObsWrapper(env)
+    return env, env_params
 
-    IQN is an off-policy Q-learning algorithm that learns the full
-    distribution of returns using implicit quantile regression.
-    """
 
-    # Network module types
-    q_network_cls: type[nnx.Module] = struct.field(pytree_node=False, default=None)
-    q_network_kwargs: dict = struct.field(pytree_node=False, default=None)
+def _create_networks(config, env, env_params, rng):
+    agent_kwargs = {}
+    if hasattr(config, "agent_kwargs") and config.agent_kwargs is not None:
+        import dataclasses
 
-    # IQN hyperparameters
-    num_epochs: int = struct.field(pytree_node=False, default=1)
-    num_tau_samples: int = struct.field(pytree_node=False, default=64)
-    num_tau_prime_samples: int = struct.field(pytree_node=False, default=64)
-    kappa: chex.Scalar = struct.field(pytree_node=True, default=1.0)
+        agent_kwargs = dataclasses.asdict(config.agent_kwargs)
 
-    def make_act(self, ts: Any) -> Callable:
-        """Create an action selection function for evaluation.
+    activation = agent_kwargs.pop("activation", "swish")
+    agent_kwargs["activation"] = getattr(nnx, activation)
+    hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
+    agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
 
-        Args:
-            ts: Training state containing network states
+    action_dim = env.action_space(env_params).n
+    obs_space = env.observation_space(env_params)
+    in_features = int(np.prod(obs_space.shape))
 
-        Returns:
-            Function that takes (obs, rng) and returns an action
-        """
-        # Reconstruct optimizer and extract Q-network
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-        q_network = q_optimizer.model
+    q_kwargs = {"in_features": in_features, "action_dim": action_dim, **agent_kwargs}
 
-        def act(obs: jax.Array, rng: chex.PRNGKey) -> jax.Array:
-            if self.normalize_observations:
-                obs = self.normalize_obs(ts.obs_rms_state, obs)
+    rng, rng_q, rng_tgt = jax.random.split(rng, 3)
+    q_network = ImplicitQuantileNetwork(**q_kwargs, rngs=nnx.Rngs(rng_q))
+    q_target = ImplicitQuantileNetwork(**q_kwargs, rngs=nnx.Rngs(rng_tgt))
 
-            obs = jnp.expand_dims(obs, 0)
-            action = q_network.act(obs, rng, epsilon=0.005)
-            return jnp.squeeze(action)
+    tx = optax.chain(
+        optax.clip(config.max_grad_norm),
+        optax.adam(learning_rate=config.learning_rate),
+    )
+    q_optimizer = nnx.Optimizer(q_network, tx)
+    return q_optimizer, q_target
 
-        return act
 
-    @classmethod
-    def create_agent(cls, config: dict, env: Environment, env_params: Any) -> dict:
-        """Create Q-network configuration.
+def _make_act(q_network, config, obs_rms=None):
+    def act(obs, rng):
+        if config.normalize_observations and obs_rms is not None:
+            obs = normalize_obs(obs_rms, obs)
+        obs = jnp.expand_dims(obs, 0)
+        return jnp.squeeze(q_network.act(obs, rng, epsilon=0.005))
 
-        Args:
-            config: Configuration dictionary, modified in-place
-            env: Environment instance
-            env_params: Environment parameters
+    return act
 
-        Returns:
-            Dictionary with network class type and kwargs
-        """
-        agent_kwargs = config.pop("agent_kwargs", {})
-        activation = agent_kwargs.pop("activation", "swish")
-        agent_kwargs["activation"] = getattr(nnx, activation)
-        hidden_layer_sizes = agent_kwargs.pop("hidden_layer_sizes", (64, 64))
-        agent_kwargs["hidden_layer_sizes"] = tuple(hidden_layer_sizes)
 
-        action_dim = env.action_space(env_params).n
-        obs_space = env.observation_space(env_params)
-        in_features = int(np.prod(obs_space.shape))
+def train_iqn(config, rng, *, env=None, env_params=None):
+    """Train IQN. Designed to be JIT-able and vmap-able over rng."""
+    if env is None:
+        env, env_params = _create_env(config)
+    else:
+        if env_params is None:
+            env_params = env.default_params
+        if config.normalize_observations:
+            env = FloatObsWrapper(env)
 
-        # Create wrapped network class
-        q_network_cls = EpsilonGreedyPolicy(ImplicitQuantileNetwork)
-        q_network_kwargs = {
-            "in_features": in_features,
-            "action_dim": action_dim,
-            **agent_kwargs,
-        }
+    eps_schedule = linear_schedule(
+        config.eps_start,
+        config.eps_end,
+        int(config.exploration_fraction * config.total_timesteps),
+    )
 
-        return {
-            "q_network_cls": q_network_cls,
-            "q_network_kwargs": q_network_kwargs,
-        }
+    num_envs = config.num_envs
+    action_space = env.action_space(env_params)
+    obs_space = env.observation_space(env_params)
+    max_steps = env_params.max_steps_in_episode
+    assert isinstance(action_space, gymnax.environments.spaces.Discrete), "IQN requires discrete action space"
 
-    @register_init
-    def initialize_network_params(self, rng: chex.PRNGKey) -> dict:
-        """Initialize Q-network and target network with optimizer.
+    vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
+    vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
-        Args:
-            rng: RNG key for network initialization
+    rng, rng_net = jax.random.split(rng)
+    q_optimizer, q_target = _create_networks(config, env, env_params, rng_net)
 
-        Returns:
-            Dictionary with network graphdefs, states, and target params
-        """
-        rng, rng_target = jax.random.split(rng)
+    rng, rng_env = jax.random.split(rng)
+    obs, env_state = vmap_reset(jax.random.split(rng_env, num_envs), env_params)
 
-        # Create networks
-        q_network = self.q_network_cls(**self.q_network_kwargs, rngs=nnx.Rngs(rng))
-        q_target = self.q_network_cls(**self.q_network_kwargs, rngs=nnx.Rngs(rng_target))
+    obs_rms = RMSState.create(obs_space.shape)
+    rew_rms = RewardRMSState.create(num_envs)
+    buf = ReplayBuffer.empty(config.buffer_size, obs_space, action_space)
 
-        # Create optimizer (only for online network)
-        tx = optax.chain(
-            optax.clip(self.max_grad_norm),
-            optax.adam(learning_rate=self.learning_rate),
-        )
-        q_optimizer = nnx.Optimizer(q_network, tx)
+    carry = IQNCarry(
+        rng=rng,
+        env_state=env_state,
+        last_obs=obs,
+        last_done=jnp.zeros(num_envs, dtype=bool),
+        global_step=0,
+        replay_buffer=buf,
+        obs_rms=obs_rms,
+        rew_rms=rew_rms,
+    )
 
-        # Split into graphdef and state for JAX transforms
-        q_graphdef, q_state = nnx.split(q_optimizer)
-        q_target_graphdef, q_target_state = nnx.split(q_target)
+    # --- Collect transitions ---
+    def collect_transitions(carry, q_network, epsilon, uniform):
+        rng, rng_action = jax.random.split(carry.rng)
+        carry = carry._replace(rng=rng)
 
-        return {
-            "q_graphdef": q_graphdef,
-            "q_state": q_state,
-            "q_target_graphdef": q_target_graphdef,
-            "q_target_state": q_target_state,
-        }
+        def sample_uniform(rng):
+            return jax.vmap(action_space.sample)(jax.random.split(rng, num_envs))
 
-    def train_iteration(self, ts: Any) -> Any:
-        """Run one training iteration.
-
-        Args:
-            ts: Training state
-
-        Returns:
-            Updated training state
-        """
-        start_training = ts.global_step > self.fill_buffer
-        old_global_step = ts.global_step
-
-        # Merge once at top
-        q_optimizer = nnx.merge(ts.q_graphdef, ts.q_state)
-        q_network = q_optimizer.model
-        q_target = nnx.merge(ts.q_target_graphdef, ts.q_target_state)
-
-        # Calculate epsilon
-        epsilon = self.epsilon_schedule(ts.global_step)
-
-        # Collect transitions
-        uniform = jnp.logical_not(start_training)
-        ts, batch = self.collect_transitions(ts, epsilon, q_network, uniform=uniform)
-        ts = ts.replace(replay_buffer=ts.replay_buffer.extend(batch))
-
-        # Perform updates to Q-network
-        def update_iteration(_, state):
-            ts, q_opt, q_tgt = state
-            rng, rng_sample, rng_update = jax.random.split(ts.rng, 3)
-            ts = ts.replace(rng=rng)
-            minibatch = ts.replay_buffer.sample(self.batch_size, rng_sample)
-            if self.normalize_observations:
-                minibatch = minibatch._replace(
-                    obs=self.normalize_obs(ts.obs_rms_state, minibatch.obs),
-                    next_obs=self.normalize_obs(ts.obs_rms_state, minibatch.next_obs),
-                )
-            if self.normalize_rewards:
-                minibatch = minibatch._replace(reward=self.normalize_rew(ts.rew_rms_state, minibatch.reward))
-
-            self.update(minibatch, q_opt, q_tgt, rng_update)
-            return (ts, q_opt, q_tgt)
-
-        def do_updates(ts, q_opt, q_tgt):
-            return nnx.fori_loop(0, self.num_epochs, update_iteration, (ts, q_opt, q_tgt))
-
-        def no_updates(ts, q_opt, q_tgt):
-            return (ts, q_opt, q_tgt)
-
-        ts, q_optimizer, q_target = nnx.cond(start_training, do_updates, no_updates, ts, q_optimizer, q_target)
-
-        # Update target network
-        online_params = nnx.state(q_network, nnx.Param)
-        if self.target_update_freq == 1:
-            target_params = nnx.state(q_target, nnx.Param)
-            updated_target_params = jax.tree.map(
-                lambda online, target: self.polyak * target + (1 - self.polyak) * online,
-                online_params,
-                target_params,
-            )
-            nnx.update(q_target, updated_target_params)
-        else:
-            update_target_params = ts.global_step % self.target_update_freq <= old_global_step % self.target_update_freq
-
-            def update_target(q_tgt):
-                nnx.update(q_tgt, online_params)
-                return q_tgt
-
-            def no_update_target(q_tgt):
-                return q_tgt
-
-            q_target = nnx.cond(update_target_params, update_target, no_update_target, q_target)
-
-        # Split once at bottom
-        _, q_state = nnx.split(q_optimizer)
-        _, q_target_state = nnx.split(q_target)
-        return ts.replace(q_state=q_state, q_target_state=q_target_state)
-
-    def collect_transitions(
-        self, ts: Any, epsilon: float, q_network: nnx.Module, uniform: bool = False
-    ) -> tuple[Any, Minibatch]:
-        """Collect transitions for the replay buffer.
-
-        Args:
-            ts: Training state
-            epsilon: Exploration epsilon for epsilon-greedy
-            q_network: Live Q-network module for action selection
-            uniform: Whether to sample actions uniformly (for initial buffer fill)
-
-        Returns:
-            Tuple of (updated_ts, minibatch)
-        """
-        # Sample actions
-        rng, rng_action = jax.random.split(ts.rng)
-        ts = ts.replace(rng=rng)
-
-        def sample_uniform(rng: chex.PRNGKey) -> jax.Array:
-            sample_fn = self.env.action_space(self.env_params).sample
-            return jax.vmap(sample_fn)(jax.random.split(rng, self.num_envs))
-
-        def sample_policy(rng: chex.PRNGKey) -> jax.Array:
-            if self.normalize_observations:
-                last_obs = self.normalize_obs(ts.obs_rms_state, ts.last_obs)
-            else:
-                last_obs = ts.last_obs
-
+        def sample_policy(rng):
+            last_obs = carry.last_obs
+            if config.normalize_observations:
+                last_obs = normalize_obs(carry.obs_rms, last_obs)
             return q_network.act(last_obs, rng, epsilon=epsilon)
 
         actions = jax.lax.cond(uniform, sample_uniform, sample_policy, rng_action)
 
-        rng, rng_steps = jax.random.split(ts.rng)
-        ts = ts.replace(rng=rng)
-        rng_steps = jax.random.split(rng_steps, self.num_envs)
-        next_obs, env_state, rewards, dones, _ = self.vmap_step(rng_steps, ts.env_state, actions, self.env_params)
+        rng, rng_steps = jax.random.split(carry.rng)
+        carry = carry._replace(rng=rng)
+        rng_steps = jax.random.split(rng_steps, num_envs)
+        next_obs, new_env_state, rewards, dones, _ = vmap_step(rng_steps, carry.env_state, actions, env_params)
 
-        if self.normalize_observations:
-            ts = ts.replace(obs_rms_state=self.update_obs_rms(ts.obs_rms_state, next_obs))
-        if self.normalize_rewards:
-            ts = ts.replace(rew_rms_state=self.update_rew_rms(ts.rew_rms_state, rewards, dones))
+        obs_rms = carry.obs_rms
+        rew_rms = carry.rew_rms
+        if config.normalize_observations:
+            obs_rms = update_rms(obs_rms, next_obs)
+        if config.normalize_rewards:
+            rew_rms = update_rew_rms(rew_rms, rewards, dones, config.gamma)
 
-        minibatch = Minibatch(
-            obs=ts.last_obs,
-            action=actions,
-            reward=rewards,
-            next_obs=next_obs,
-            done=dones,
-        )
-        ts = ts.replace(
+        mb = Minibatch(obs=carry.last_obs, action=actions, reward=rewards, next_obs=next_obs, done=dones)
+        carry = carry._replace(
             last_obs=next_obs,
-            env_state=env_state,
-            global_step=ts.global_step + self.num_envs,
+            env_state=new_env_state,
+            global_step=carry.global_step + num_envs,
+            obs_rms=obs_rms,
+            rew_rms=rew_rms,
         )
-        return ts, minibatch
+        return carry, mb
 
-    def update(self, mb: Minibatch, q_optimizer: nnx.Optimizer, q_target: nnx.Module, rng: chex.PRNGKey) -> None:
-        """Perform one update step on the Q-network. Mutates q_optimizer in-place.
-
-        Rewards must be pre-normalized by the caller if normalize_rewards is enabled.
-
-        Args:
-            mb: Minibatch of transitions
-            q_optimizer: Live Q-network optimizer
-            q_target: Live target network
-            rng: RNG key for tau sampling
-        """
+    # --- Update Q-network ---
+    def update_q(mb, q_optimizer, q_target, rng):
         q_network = q_optimizer.model
 
-        # Split off multiple keys for tau and tau_prime
         rng_action, rng_tau, rng_tau_prime = jax.random.split(rng, 3)
-        rng_tau = jax.random.split(rng_tau, self.num_tau_samples)
-        rng_tau_prime = jax.random.split(rng_tau_prime, self.num_tau_prime_samples)
+        rng_tau = jax.random.split(rng_tau, config.num_tau_samples)
+        rng_tau_prime = jax.random.split(rng_tau_prime, config.num_tau_prime_samples)
 
-        # Compute targets using target network
-        # best_action is computed using online network (double Q-learning)
         best_action = q_network.best_action(mb.next_obs, rng_action)
 
-        # Compute target quantiles - vmap over tau samples
-        # This creates shape (batch, num_tau_prime_samples, action_dim)
         def compute_target_z(rng_t):
             zs, _ = q_target(mb.next_obs, rng_t)
             return zs
 
         zs = jax.vmap(compute_target_z, in_axes=0, out_axes=1)(rng_tau_prime)
         best_z = jnp.take_along_axis(zs, best_action[:, None, None], axis=2).squeeze(2)
+        targets = mb.reward[:, None] + config.gamma * (1 - mb.done[:, None]) * best_z
 
-        targets = mb.reward[:, None] + self.gamma * (1 - mb.done[:, None]) * best_z
-        assert targets.shape == (self.batch_size, self.num_tau_prime_samples)
-
-        # Vmap over batch and sampled taus for quantile huber loss
         @jax.vmap
         @jax.vmap
-        def rho(td_err: jax.Array, tau: jax.Array) -> jax.Array:
-            l = optax.huber_loss(td_err, delta=self.kappa)
-            return jnp.abs(tau - (td_err < 0)) * l / self.kappa
+        def rho(td_err, tau):
+            l = optax.huber_loss(td_err, delta=config.kappa)
+            return jnp.abs(tau - (td_err < 0)) * l / config.kappa
 
-        def loss_fn(model: nnx.Module) -> jax.Array:
-            # Compute online quantiles - vmap over tau samples
-            # This creates shape (batch, num_tau_samples, action_dim)
+        def loss_fn(model):
             def compute_z(rng_t):
                 z, tau = model(mb.obs, rng_t)
                 return z, tau
 
-            z_list, tau_list = jax.vmap(compute_z, in_axes=0, out_axes=1)(rng_tau)
-            # z has shape (batch, num_tau_samples, action_dim)
-            # tau has shape (batch, num_tau_samples)
-            z = z_list
-            tau = tau_list
-
-            # Take action values - shape becomes (batch, num_tau_samples)
+            z, tau = jax.vmap(compute_z, in_axes=0, out_axes=1)(rng_tau)
             z = jnp.take_along_axis(z, mb.action[:, None, None], axis=2).squeeze(2)
-
-            # Compute TD errors - shape (batch, num_tau_samples, num_tau_prime_samples)
             td_err = jax.vmap(lambda x, y: x[None, :] - y[:, None])(targets, z)
-
-            # Compute quantile huber loss
             loss = rho(td_err, tau).sum(axis=1)
             return loss.mean()
 
-        loss, grads = nnx.value_and_grad(loss_fn)(q_network)
+        _loss, grads = nnx.value_and_grad(loss_fn)(q_network)
         q_optimizer.update(grads)
+
+    # --- Train iteration ---
+    def train_iteration(carry, q_optimizer, q_target):
+        start_training = carry.global_step > config.fill_buffer
+        old_global_step = carry.global_step
+
+        epsilon = eps_schedule(carry.global_step)
+        uniform = jnp.logical_not(start_training)
+        carry, batch = collect_transitions(carry, q_optimizer.model, epsilon, uniform)
+        carry = carry._replace(replay_buffer=carry.replay_buffer.extend(batch))
+
+        def update_iteration(_, state):
+            carry, q_opt, q_tgt = state
+            rng, rng_sample, rng_update = jax.random.split(carry.rng, 3)
+            carry = carry._replace(rng=rng)
+            minibatch = carry.replay_buffer.sample(config.batch_size, rng_sample)
+            if config.normalize_observations:
+                minibatch = minibatch._replace(
+                    obs=normalize_obs(carry.obs_rms, minibatch.obs),
+                    next_obs=normalize_obs(carry.obs_rms, minibatch.next_obs),
+                )
+            if config.normalize_rewards:
+                minibatch = minibatch._replace(reward=normalize_rew(carry.rew_rms, minibatch.reward))
+            update_q(minibatch, q_opt, q_tgt, rng_update)
+            return (carry, q_opt, q_tgt)
+
+        def do_updates(carry, q_opt, q_tgt):
+            return nnx.fori_loop(0, config.num_epochs, update_iteration, (carry, q_opt, q_tgt))
+
+        def no_updates(carry, q_opt, q_tgt):
+            return (carry, q_opt, q_tgt)
+
+        carry, q_optimizer, q_target = nnx.cond(start_training, do_updates, no_updates, carry, q_optimizer, q_target)
+
+        # Update target network
+        q_network = q_optimizer.model
+        online_params = nnx.state(q_network, nnx.Param)
+        if config.target_update_freq == 1:
+            target_params = nnx.state(q_target, nnx.Param)
+            updated = jax.tree.map(lambda o, t: config.polyak * t + (1 - config.polyak) * o, online_params, target_params)
+            nnx.update(q_target, updated)
+        else:
+            do_update = carry.global_step % config.target_update_freq <= old_global_step % config.target_update_freq
+
+            def _update(q_tgt):
+                nnx.update(q_tgt, online_params)
+                return q_tgt
+
+            def _no_update(q_tgt):
+                return q_tgt
+
+            q_target = nnx.cond(do_update, _update, _no_update, q_target)
+
+        return carry, q_optimizer, q_target
+
+    # --- Eval callback ---
+    def eval_callback(carry, q_optimizer):
+        act_fn = _make_act(q_optimizer.model, config, carry.obs_rms)
+        return evaluate(act_fn, carry.rng, env, env_params, 128, max_steps)
+
+    # --- Outer training loop ---
+    steps_per_iter = int(np.ceil(config.eval_freq / num_envs))
+    num_evals = int(np.ceil(config.total_timesteps / config.eval_freq))
+
+    if not config.skip_initial_evaluation:
+        initial_eval = eval_callback(carry, q_optimizer)
+
+    def eval_iteration(state, _):
+        carry, q_opt, q_tgt = state
+
+        def train_body(_, s):
+            return train_iteration(*s)
+
+        carry, q_opt, q_tgt = nnx.fori_loop(0, steps_per_iter, train_body, (carry, q_opt, q_tgt))
+        metrics = eval_callback(carry, q_opt)
+        return (carry, q_opt, q_tgt), metrics
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def scan_eval(state, _dummy):
+        return eval_iteration(state, _dummy)
+
+    (carry, q_optimizer, q_target), all_metrics = scan_eval((carry, q_optimizer, q_target), jnp.zeros(num_evals))
+
+    if not config.skip_initial_evaluation:
+        all_metrics = jax.tree.map(
+            lambda i, ev: jnp.concatenate((jnp.expand_dims(i, 0), ev)),
+            initial_eval,
+            all_metrics,
+        )
+
+    state = {
+        "q_optimizer": q_optimizer,
+        "q_target": q_target,
+        "obs_rms_state": carry.obs_rms,
+        "rew_rms_state": carry.rew_rms,
+        "global_step": carry.global_step,
+    }
+    return state, all_metrics

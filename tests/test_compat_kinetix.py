@@ -1,192 +1,143 @@
-import unittest
-
 import jax
+import pytest
 
 from rejax.compat.kinetix2gymnax import create_kinetix
 
 
-class TestKinetixCompat(unittest.TestCase):
-    def test_create_kinetix_environments(self):
-        """Test creating and basic functionality of Kinetix environments."""
-        rng = jax.random.PRNGKey(0)
+# fmt: off
+KINETIX_LEVELS = [
+    "s/h1_thrust_over_ball", "s/h2_one_wheel_car", "s/h8_unicycle_balance",
+    "m/h1_car_left", "m/h8_weird_vehicle", "m/h14_thrustblock",
+    "l/h5_flappy_bird", "l/hard_pinball", "l/lever_puzzle",
+]
+# fmt: on
 
-        # Test common Kinetix level files
-        # fmt: off
-        kinetix_levels = [
-            "s/h1_thrust_over_ball", "s/h2_one_wheel_car", "s/h8_unicycle_balance",
-            "m/h1_car_left", "m/h8_weird_vehicle", "m/h14_thrustblock",
-            "l/h5_flappy_bird", "l/hard_pinball", "l/lever_puzzle",
-        ]
-        # fmt: on
 
-        for level_name in kinetix_levels:
-            with self.subTest(level=level_name):
-                try:
-                    env, params = create_kinetix(level_name)
-                except Exception as e:
-                    # Skip levels that might not be available
-                    self.skipTest(f"Level {level_name} not available: {e}")
+@pytest.mark.parametrize("level_name", KINETIX_LEVELS)
+def test_create_kinetix_environments(level_name):
+    """Test creating and basic functionality of Kinetix environments."""
+    rng = jax.random.PRNGKey(0)
 
-                # JIT the reset and step functions
-                jitted_reset = jax.jit(env.reset)
-                jitted_step = jax.jit(env.step)
+    try:
+        env, params = create_kinetix(level_name)
+    except Exception as e:
+        pytest.skip(f"Level {level_name} not available: {e}")
 
-                # Test reset
-                try:
-                    obs, state = jitted_reset(rng, params)
-                except Exception as e:
-                    self.fail(f"Failed to reset {level_name}: {type(e).__name__}: {e}")
+    jitted_reset = jax.jit(env.reset)
+    jitted_step = jax.jit(env.step)
 
-                # Test observation space
-                try:
-                    obs_space = env.observation_space(params)
-                    self.assertEqual(obs.dtype, obs_space.dtype)
-                    self.assertEqual(obs.shape, obs_space.shape)
-                except Exception as e:
-                    self.fail(f"Failed to get obs space for {level_name}: {type(e).__name__}: {e}")
+    obs, state = jitted_reset(rng, params)
 
-                # Test action space and sampling
-                try:
-                    action_space = env.action_space(params)
-                    action = action_space.sample(rng)
-                    self.assertEqual(action.dtype, action_space.dtype)
-                    self.assertEqual(action.shape, action_space.shape)
-                except Exception as e:
-                    self.fail(f"Failed to sample action for {level_name}: {type(e).__name__}: {e}")
+    obs_space = env.observation_space(params)
+    assert obs.dtype == obs_space.dtype
+    assert obs.shape == obs_space.shape
 
-                # Test stepping
-                for step in range(5):
-                    try:
-                        obs, state, reward, done, _info = jitted_step(rng, state, action, params)
+    action_space = env.action_space(params)
+    action = action_space.sample(rng)
+    assert action.dtype == action_space.dtype
+    assert action.shape == action_space.shape
 
-                        # Check types and shapes
-                        self.assertEqual(obs.dtype, obs_space.dtype)
-                        self.assertEqual(obs.shape, obs_space.shape)
-                        self.assertTrue(hasattr(reward, "dtype"))
-                        self.assertTrue(hasattr(done, "dtype"))
+    for step in range(5):
+        obs, state, reward, done, _info = jitted_step(rng, state, action, params)
 
-                        # If episode is done, break
-                        if done:
-                            break
+        assert obs.dtype == obs_space.dtype
+        assert obs.shape == obs_space.shape
+        assert hasattr(reward, "dtype")
+        assert hasattr(done, "dtype")
 
-                    except Exception as e:
-                        self.fail(f"Failed to step {level_name} at step {step}: {type(e).__name__}: {e}")
+        if done:
+            break
 
-                    # Sample new action for next step
-                    action = action_space.sample(rng)
-
-    def test_kinetix_continuous_actions(self):
-        """Test that Kinetix environments use continuous actions by default."""
-        rng = jax.random.PRNGKey(0)
-
-        try:
-            env, params = create_kinetix("s/h0_weak_thrust")
-        except Exception:
-            self.skipTest("No test level available for Kinetix")
-
-        # Test that action space is continuous (Box)
-        action_space = env.action_space(params)
-        from gymnax.environments.spaces import Box
-
-        self.assertIsInstance(action_space, Box)
-
-        # Test action sampling
         action = action_space.sample(rng)
-        self.assertTrue(hasattr(action, "dtype"))
-
-        # Test that we can step with continuous actions
-        obs, state = env.reset(rng, params)
-        obs, state, _reward, _done, _info = env.step(rng, state, action, params)
-        self.assertIsNotNone(obs)
-
-    def test_kinetix_symbolic_flat_observations(self):
-        """Test that Kinetix uses symbolic flat observations by default."""
-        rng = jax.random.PRNGKey(0)
-
-        try:
-            env, params = create_kinetix("s/h0_weak_thrust")
-        except Exception:
-            self.skipTest("No test level available for Kinetix")
-
-        obs, _state = env.reset(rng, params)
-
-        # Test that observations are flat (1D)
-        self.assertEqual(len(obs.shape), 1)
-
-        # Test that observation space matches
-        obs_space = env.observation_space(params)
-        self.assertEqual(obs.shape, obs_space.shape)
-
-    def test_kinetix_custom_kwargs(self):
-        """Test that custom kwargs can be passed to create_kinetix."""
-        from gymnax.environments.spaces import Box, Discrete
-        from kinetix.environment.spaces import ActionType, ObservationType
-
-        try:
-            # Test with discrete actions
-            env, params = create_kinetix(
-                "s/h0_weak_thrust",
-                action_type=ActionType.DISCRETE,
-                observation_type=ObservationType.SYMBOLIC_FLAT,
-            )
-        except Exception:
-            self.skipTest("No test level available for Kinetix or ActionType not available")
-
-        # If we get here, the environment was created successfully
-        self.assertIsNotNone(env)
-        self.assertIsNotNone(params)
-        self.assertIsInstance(env.action_space(params), Discrete)
-        self.assertEqual(len(env.action_space(params).shape), 0)
-        self.assertIsInstance(env.observation_space(params), Box)
-        self.assertEqual(len(env.observation_space(params).shape), 1)
-
-    def test_kinetix_env_params(self):
-        """Test that environment parameters have max_steps_in_episode."""
-        # fmt: off
-        kinetix_levels = [
-            "s/h1_thrust_over_ball", "s/h2_one_wheel_car", "s/h8_unicycle_balance",
-            "m/h1_car_left", "m/h8_weird_vehicle", "m/h14_thrustblock",
-            "l/h5_flappy_bird", "l/hard_pinball", "l/lever_puzzle",
-        ]
-        # fmt: on
-
-        for level_name in kinetix_levels:
-            with self.subTest(level=level_name):
-                try:
-                    _env, params = create_kinetix(level_name)
-                except Exception as e:
-                    self.skipTest(f"Level {level_name} not available: {e}")
-
-                # Test that params have max_steps_in_episode attribute
-                self.assertTrue(hasattr(params, "max_steps_in_episode"))
-                self.assertIsInstance(params.max_steps_in_episode, int)
-
-                # Test that dt attribute is accessible
-                self.assertTrue(hasattr(params, "dt"))
-                original_dt = params.dt
-
-                # Test that max_steps_in_episode equals max_timesteps
-                self.assertEqual(params.max_steps_in_episode, params.max_timesteps)
-
-                # Test that replacing dt works
-                new_dt = original_dt * 2.0
-                new_params = params.replace(dt=new_dt)
-                self.assertEqual(new_params.dt, new_dt)
-
-                # Test that replacing max_steps_in_episode works and auto-syncs
-                new_max_steps = params.max_steps_in_episode + 100
-                new_params = params.replace(max_steps_in_episode=new_max_steps)
-                self.assertEqual(new_params.max_steps_in_episode, new_max_steps)
-                # Auto-sync: max_timesteps should also be updated
-                self.assertEqual(new_params.max_timesteps, new_max_steps)
-
-                # Test that replacing max_timesteps works and auto-syncs
-                new_max_timesteps = params.max_timesteps + 50
-                new_params = params.replace(max_timesteps=new_max_timesteps)
-                self.assertEqual(new_params.max_timesteps, new_max_timesteps)
-                # Auto-sync: max_steps_in_episode should also be updated
-                self.assertEqual(new_params.max_steps_in_episode, new_max_timesteps)
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_kinetix_continuous_actions():
+    """Test that Kinetix environments use continuous actions by default."""
+    rng = jax.random.PRNGKey(0)
+
+    try:
+        env, params = create_kinetix("s/h0_weak_thrust")
+    except Exception:
+        pytest.skip("No test level available for Kinetix")
+
+    action_space = env.action_space(params)
+    from gymnax.environments.spaces import Box
+
+    assert isinstance(action_space, Box)
+
+    action = action_space.sample(rng)
+    assert hasattr(action, "dtype")
+
+    obs, state = env.reset(rng, params)
+    obs, state, _reward, _done, _info = env.step(rng, state, action, params)
+    assert obs is not None
+
+
+def test_kinetix_symbolic_flat_observations():
+    """Test that Kinetix uses symbolic flat observations by default."""
+    rng = jax.random.PRNGKey(0)
+
+    try:
+        env, params = create_kinetix("s/h0_weak_thrust")
+    except Exception:
+        pytest.skip("No test level available for Kinetix")
+
+    obs, _state = env.reset(rng, params)
+
+    assert len(obs.shape) == 1
+
+    obs_space = env.observation_space(params)
+    assert obs.shape == obs_space.shape
+
+
+def test_kinetix_custom_kwargs():
+    """Test that custom kwargs can be passed to create_kinetix."""
+    from gymnax.environments.spaces import Box, Discrete
+    from kinetix.environment.spaces import ActionType, ObservationType
+
+    try:
+        env, params = create_kinetix(
+            "s/h0_weak_thrust",
+            action_type=ActionType.DISCRETE,
+            observation_type=ObservationType.SYMBOLIC_FLAT,
+        )
+    except Exception:
+        pytest.skip("No test level available for Kinetix or ActionType not available")
+
+    assert env is not None
+    assert params is not None
+    assert isinstance(env.action_space(params), Discrete)
+    assert len(env.action_space(params).shape) == 0
+    assert isinstance(env.observation_space(params), Box)
+    assert len(env.observation_space(params).shape) == 1
+
+
+@pytest.mark.parametrize("level_name", KINETIX_LEVELS)
+def test_kinetix_env_params(level_name):
+    """Test that environment parameters have max_steps_in_episode."""
+    try:
+        _env, params = create_kinetix(level_name)
+    except Exception as e:
+        pytest.skip(f"Level {level_name} not available: {e}")
+
+    assert hasattr(params, "max_steps_in_episode")
+    assert isinstance(params.max_steps_in_episode, int)
+
+    assert hasattr(params, "dt")
+    original_dt = params.dt
+
+    assert params.max_steps_in_episode == params.max_timesteps
+
+    new_dt = original_dt * 2.0
+    new_params = params.replace(dt=new_dt)
+    assert new_params.dt == new_dt
+
+    new_max_steps = params.max_steps_in_episode + 100
+    new_params = params.replace(max_steps_in_episode=new_max_steps)
+    assert new_params.max_steps_in_episode == new_max_steps
+    assert new_params.max_timesteps == new_max_steps
+
+    new_max_timesteps = params.max_timesteps + 50
+    new_params = params.replace(max_timesteps=new_max_timesteps)
+    assert new_params.max_timesteps == new_max_timesteps
+    assert new_params.max_steps_in_episode == new_max_timesteps
