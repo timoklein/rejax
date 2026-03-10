@@ -56,17 +56,20 @@ from rejax import get_train_fn, PPOConfig
 train_fn = get_train_fn("ppo")
 config = PPOConfig.from_yaml("configs/ppo/gymnax/cartpole.yaml")
 state, metrics = jax.jit(jax.vmap(train_fn, in_axes=(None, 0)), static_argnums=(0,))(config, keys)
+# metrics is a dict: eval_lengths, eval_returns, global_step, plus algo-specific training metrics
 ```
 
 **Shared utilities** (`src/rejax/algos/utils.py`): `create_env`, `resolve_network_kwargs`, `polyak_update`, `maybe_update_targets`, `normalize_minibatch`, `make_eval_act` — identical infrastructure code extracted from all 6 algo files.
 
-**NamedTuple carry**: Each algo defines a `*Carry` NamedTuple for non-module state (rng, env_state, replay buffer, normalization stats).
+**NamedTuple carry**: Each algo defines a `*Carry` NamedTuple for non-module state (rng, env_state, replay buffer, normalization stats, training metrics accumulator).
+
+**Training metrics**: All algorithms return per-eval-period averaged training metrics as `Metrics = dict[str, jax.Array]`. Each `train_*` function accepts an optional `log_fn` callback for real-time logging via `jax.debug.callback`.
 
 ### Key Modules
 
 - `src/rejax/algos/{ppo,td3,sac,iqn,pqn,dqn}.py` - Standalone `train_*` functions using Flax NNX
 - `src/rejax/algos/utils.py` - Shared helpers (env creation, normalization, target updates, eval policy)
-- `src/rejax/types.py` - Shared type aliases (`TrainState`, `EvalMetrics`, `TrainFn`, `ActFn`, `GymnaxEnv` protocol)
+- `src/rejax/types.py` - Shared type aliases (`TrainState`, `Metrics`, `TrainFn`, `ActFn`, `GymnaxEnv` protocol)
 - `src/rejax/configs.py` - Typed config dataclasses (`PPOConfig`, `SACConfig`, etc.) + `ALGO_CONFIG_MAP`
 - `src/rejax/networks.py` - Flax NNX networks (DiscretePolicy, GaussianPolicy, QNetwork, VNetwork, etc.)
 - `src/rejax/buffers.py` - JAX-native `ReplayBuffer` and `CircularBuffer`
@@ -82,6 +85,9 @@ from rejax import ALGO_CONFIG_MAP, get_train_fn
 config = PPOConfig.from_yaml("configs/ppo/gymnax/cartpole.yaml")
 train_fn = get_train_fn("ppo")
 state, metrics = train_fn(config, jax.random.PRNGKey(0))
+# metrics["eval_returns"] shape: (num_evals, 128)
+# metrics["global_step"] shape: (num_evals,)
+# metrics["actor_loss"] shape: (num_evals,)  — per-eval-period average
 ```
 
 **Config directory layout**: `configs/{algo}/{suite}/{env}.yaml` (one file per algo+env)
@@ -117,6 +123,34 @@ Algorithms use Flax NNX (`flax.nnx`) instead of Flax Linen. Key patterns:
 - `jax.lax.fori_loop` / `jax.lax.scan` / `jax.lax.cond` with module args
 - `nnx.split` / `nnx.merge` anywhere except final return
 - `jax.jit` instead of `nnx.jit` wrapping module calls
+
+### Training Metrics
+
+All `train_*` functions return `(TrainState, Metrics)` where `Metrics = dict[str, jax.Array]`.
+
+**Common keys** (all algorithms): `eval_lengths`, `eval_returns`, `global_step`
+
+**Per-algorithm training metrics** (averaged over each eval period):
+
+| Algorithm | Metrics |
+|-----------|---------|
+| PPO | `actor_loss`, `critic_loss`, `entropy`, `clip_fraction`, `approx_kl`, `explained_variance` |
+| SAC | `actor_loss`, `critic_loss`, `alpha`, `entropy` |
+| DQN | `td_loss`, `mean_q_value`, `epsilon` |
+| TD3 | `actor_loss`, `critic_loss`, `mean_q_value` |
+| IQN | `quantile_loss`, `mean_q_value` |
+| PQN | `td_loss`, `mean_q_value`, `epsilon` |
+
+**Real-time logging**: Pass `log_fn` to any `train_*` function. Called via `jax.debug.callback` at each eval point. Bind with `functools.partial` before `jax.jit`/`jax.vmap`:
+
+```python
+train_with_log = functools.partial(train_ppo, log_fn=lambda m: wandb.log({k: float(v) for k, v in m.items() if v.ndim == 0}))
+```
+
+**Implementation notes**:
+- Metrics accumulate as running sums + count in the carry NamedTuple's `train_metrics` dict
+- Off-policy algos (DQN, SAC, TD3, IQN) only accumulate when `start_training=True` (after buffer fill)
+- Carry reset inside `nnx.scan` must use traced ops (`x * 0`) to preserve carry references — never Python literals
 
 ### Shape Suffix Convention
 
@@ -158,7 +192,7 @@ Adapters in `src/rejax/compat/` convert library-specific APIs to the gymnax inte
 
 Pyright in `basic` mode enforces types on `src/rejax/` (excluding `compat/` and tests). Key conventions:
 
-- **`src/rejax/types.py`**: Shared aliases — `TrainState`, `EvalMetrics`, `TrainFn`, `ActFn`, `EnvParams`, and the `GymnaxEnv` protocol for structural typing of environments (gymnax + `FloatObsWrapper`).
+- **`src/rejax/types.py`**: Shared aliases — `TrainState`, `Metrics`, `EvalMetrics`, `TrainFn`, `ActFn`, `EnvParams`, and the `GymnaxEnv` protocol for structural typing of environments (gymnax + `FloatObsWrapper`).
 - **Public function signatures**: All `train_*`, `_create_networks`, and `utils.py` helpers are fully typed with concrete config types and return types.
 - **Inner closures**: Not typed — pyright infers from enclosing scope.
 - **`jax.Array`** over `chex.Array`: Consistent with `networks.py` convention.
